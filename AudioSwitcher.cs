@@ -44,7 +44,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 3;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 4;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public int Channels { get; set; } = 2;
         public int IdleTier { get; set; } = 0;
@@ -141,6 +141,14 @@ namespace AudioSwitcher
             "EABackgroundService.exe", "SnippingTool.exe", "ScreenClippingHost.exe",
             "ScreenSketch.exe", "Calculator.exe", "Microsoft.Photos.exe",
             "WindowsTerminal.exe", "Notepad.exe"
+        };
+
+        // Always treated as games by exe name, regardless of path/launcher. This is the escape
+        // hatch for games that don't sit under a known store folder or launcher - e.g. Store/UWP
+        // games in WindowsApps (Minecraft Bedrock), portable installs, emulators. Add your own.
+        public List<string> GameProcesses { get; set; } = new()
+        {
+            "Minecraft.Windows.exe"      // Minecraft Bedrock (UWP, in WindowsApps - not caught by path/launcher)
         };
     }
 
@@ -842,6 +850,10 @@ namespace AudioSwitcher
             if (cfg.IgnoreProcesses.Any(n => string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase)))
                 return null;
 
+            // Allowlist: exe names explicitly declared games (Store/UWP games, portable, user-added).
+            if (cfg.GameProcesses.Any(n => string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase)))
+                return (true, $"name:{fileName}");
+
             foreach (var hint in cfg.GamePathHints)
             {
                 if (exePath.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
@@ -989,6 +1001,7 @@ namespace AudioSwitcher
             c.LauncherProcesses ??= d.LauncherProcesses;
             c.GamePathHints ??= d.GamePathHints;
             c.IgnoreProcesses ??= d.IgnoreProcesses;
+            c.GameProcesses ??= d.GameProcesses;
             c.KnownQuirky ??= d.KnownQuirky;
             return c;
         }

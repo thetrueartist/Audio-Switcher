@@ -114,7 +114,9 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
   (e.g. `"FiiO K7"`) to pin one endpoint.
 - `ProfileTiers`, `EngineDefaults`, `KnownQuirky` — the ladder, per-engine start tier,
   hardcoded per-exe tiers.
-- `LauncherProcesses` / `GamePathHints` — how games are detected (add your own).
+- `LauncherProcesses` / `GamePathHints` — how games are detected. `GameProcesses` — exe
+  names always treated as games (add any game here, e.g. a Store/UWP or portable game).
+  `IgnoreProcesses` — never games (launcher helpers, non-game Store apps).
 - `CrashThresholdSeconds`, `GlitchThreshold`, `GlitchWindowSeconds` — learning sensitivity.
 - `SilenceWindowSeconds` — **0 = off**; set e.g. `15` to enable silence learning (verify
   with `--sessions` first). `SilenceGraceSeconds` ignores the first N seconds (loading).
