@@ -7,8 +7,10 @@ obj/
 *.user
 *.suo
 
-# Published binary / temp build dir used by AudioSwitcher.ps1
+# Published binary / temp build + release-packaging dirs
 publish/
+dist/
+*.zip
 
 # OS cruft
 Thumbs.db

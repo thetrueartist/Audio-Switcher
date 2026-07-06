@@ -1,5 +1,7 @@
 # AudioSwitcher
 
+[![build](https://github.com/thetrueartist/Audio-Switcher/actions/workflows/build.yml/badge.svg)](https://github.com/thetrueartist/Audio-Switcher/actions/workflows/build.yml)
+
 A small Windows daemon that automatically lowers your output device's shared-mode
 sample rate / bit depth when a game launches, and restores your high-quality
 ("audiophile") format when all games exit.
