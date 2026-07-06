@@ -687,6 +687,33 @@ namespace AudioSwitcher
         private interface IAudioMeterInformation
         {
             [PreserveSig] int GetPeakValue(out float peak);
+            [PreserveSig] int GetMeteringChannelCount(out uint count);
+        }
+
+        private static readonly Guid IID_IAudioMeterInformation = new("C02216F6-8C67-4B5B-9D00-D008E73E0064");
+
+        // Is a working peak meter available on the default endpoint? A real meter reports its
+        // channel count (>0); a broken/absent one doesn't. Lets us validate silence detection at
+        // startup WITHOUT playing any sound. Endpoint-level meter (master output).
+        public static bool MeterAvailable()
+        {
+            IMMDeviceEnumerator? en = null; IMMDevice? dev = null; IAudioMeterInformation? meter = null;
+            try
+            {
+                en = (IMMDeviceEnumerator)new CMMDeviceEnumerator();
+                if (en.GetDefaultAudioEndpoint(0, 0, out dev) != 0 || dev == null) return false;
+                var iid = IID_IAudioMeterInformation;
+                if (dev.Activate(ref iid, 23, IntPtr.Zero, out object m) != 0 || m == null) return false;
+                meter = (IAudioMeterInformation)m;
+                return meter.GetMeteringChannelCount(out uint ch) == 0 && ch > 0;
+            }
+            catch { return false; }
+            finally
+            {
+                if (meter != null) Marshal.ReleaseComObject(meter);
+                if (dev != null) Marshal.ReleaseComObject(dev);
+                if (en != null) Marshal.ReleaseComObject(en);
+            }
         }
 
         public readonly struct SessionInfo
@@ -1473,6 +1500,11 @@ namespace AudioSwitcher
             _ipcThread.Start();
             _autoLearnThread = new Thread(AutoLearnPump) { IsBackground = true, Name = "AutoLearn" };
             _autoLearnThread.Start();
+
+            // Validate the peak meter at startup WITHOUT playing any sound: if the endpoint reports a
+            // working meter, silence detection can run immediately (no need to wait for some app to
+            // play). Still gets reinforced by seeing a real peak >0 later.
+            try { if (EndpointManager.MeterAvailable()) { _meterEverPositive = true; if (_verbose) Log("Peak meter present - silence detection ready"); } } catch { }
 
             // Background update check (GitHub Releases API, notify only) - never blocks startup.
             if (_config.CheckForUpdates)
