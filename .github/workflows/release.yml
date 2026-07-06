@@ -29,7 +29,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item publish/AudioSwitcher.exe dist/
-          Copy-Item AudioSwitcher.ps1,AudioSwitcher.cmd,Build.cmd,Install.cmd,README.md,LICENSE dist/
+          # Wildcards so new launchers/scripts are always included automatically.
+          Copy-Item *.cmd, *.ps1, README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath AudioSwitcher-win-x64.zip -Force
 
       - name: Create release
