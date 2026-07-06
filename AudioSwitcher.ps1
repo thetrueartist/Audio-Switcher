@@ -146,9 +146,25 @@ Or: winget install Microsoft.DotNet.SDK.8
     }
 }
 
+# Make sure $Exe exists at the install location. Order: already installed ->
+# prebuilt exe bundled next to this script (the release zip) -> compile from source.
+function Ensure-Exe {
+    if (Test-Path $Exe) { return $true }
+    $bundled = Join-Path $ScriptDir "AudioSwitcher.exe"
+    if (Test-Path $bundled) {
+        if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
+        Copy-Item $bundled $Exe -Force
+        Write-Host "  Using bundled AudioSwitcher.exe -> $InstallDir" -ForegroundColor DarkGray
+        return $true
+    }
+    if (Test-Path $SourceCs) { Build-Exe; return (Test-Path $Exe) }
+    Write-Error "No AudioSwitcher.exe and no AudioSwitcher.cs found next to this script."
+    return $false
+}
+
 function Install-Task {
     Assert-Admin
-    if (-not (Test-Path $Exe)) { Build-Exe }
+    if (-not (Ensure-Exe)) { return }
 
     # Remove old task if it exists
     if (Test-Task) {
@@ -195,7 +211,7 @@ function Uninstall-Task {
 }
 
 function Start-Daemon {
-    if (-not (Test-Path $Exe)) { Build-Exe }
+    if (-not (Ensure-Exe)) { return }
     if (Test-Task) {
         Start-ScheduledTask -TaskName $TaskName
     } else {
@@ -278,7 +294,7 @@ switch ($PSCmdlet.ParameterSetName) {
     }
     'Foreground'  {
         Assert-Admin
-        if (-not (Test-Path $Exe)) { Build-Exe }
+        if (-not (Ensure-Exe)) { return }
         $cmdArgs = @("--console")   # --console = live log in this window, not the tray
         if ($Verbose2) { $cmdArgs += "--verbose" }
         & $Exe @cmdArgs
@@ -303,7 +319,7 @@ switch ($PSCmdlet.ParameterSetName) {
             '2' { Show-Status }
             '3' { if (Test-Path $Exe) { & $Exe --show-state } else { Write-Host "  Build first (option 1)." -ForegroundColor Yellow } }
             '4' { if (Test-Path $Exe) { & $Exe --list-devices } else { Write-Host "  Build first (option 1)." -ForegroundColor Yellow } }
-            '5' { if (-not (Invoke-Elevated '-Foreground')) { if (-not (Test-Path $Exe)) { Build-Exe }; & $Exe --console } }
+            '5' { if (-not (Invoke-Elevated '-Foreground')) { if (Ensure-Exe) { & $Exe --console } } }
             '6' { if (-not (Invoke-Elevated '-Stop'))      { Stop-Daemon } }
             '7' { if (-not (Invoke-Elevated '-Uninstall')) { Uninstall-Task } }
             'Q' { }
