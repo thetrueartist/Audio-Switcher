@@ -1737,7 +1737,7 @@ namespace AudioSwitcher
             Application.SetCompatibleTextRenderingDefault(false);
 
             var menu = new ContextMenuStrip();
-            var hdr = new ToolStripMenuItem("AudioSwitcher") { Enabled = false };
+            var hdr = new ToolStripMenuItem("AudioSwitcher v" + Program.AppVersion()) { Enabled = false };
             var open = new ToolStripMenuItem("Open control panel...") { Font = new Font(SystemFonts.MenuFont ?? SystemFonts.DefaultFont, FontStyle.Bold) };
             var status = new ToolStripMenuItem("starting...") { Enabled = false };
             var games = new ToolStripMenuItem("No games running") { Enabled = false };
@@ -1877,7 +1877,7 @@ namespace AudioSwitcher
         public MainWindow(Daemon d)
         {
             _d = d;
-            Text = "AudioSwitcher";
+            Text = "AudioSwitcher v" + Program.AppVersion();
             ClientSize = new Size(460, 560);
             MinimumSize = new Size(420, 480);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1896,7 +1896,7 @@ namespace AudioSwitcher
             var title = new Label { Text = "AudioSwitcher", AutoSize = true, Location = new Point(x, y),
                 Font = new Font(Font.FontFamily, 15, FontStyle.Bold), ForeColor = Color.FromArgb(46, 130, 200) };
             Controls.Add(title);
-            var by = new Label { Text = "by @thetrueartist", AutoSize = true, ForeColor = Color.Gray,
+            var by = new Label { Text = "v" + Program.AppVersion() + "    by @thetrueartist", AutoSize = true, ForeColor = Color.Gray,
                 Location = new Point(x + 2, y + 30) };
             Controls.Add(by);
             y += 58;
@@ -2024,6 +2024,13 @@ namespace AudioSwitcher
         [DllImport("kernel32.dll")] private static extern bool AttachConsole(int dwProcessId);
         private const int ATTACH_PARENT_PROCESS = -1;
 
+        // Assembly version (set from the git tag by the release workflow; "dev" for local builds).
+        public static string AppVersion()
+        {
+            var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+            return (v == null || v.Major == 0) ? "dev" : $"{v.Major}.{v.Minor}.{v.Build}";
+        }
+
         [STAThread]
         public static int Main(string[] args)
         {
@@ -2032,6 +2039,7 @@ namespace AudioSwitcher
             try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
             try
             {
+                if (args.Contains("--version")) { Console.WriteLine($"AudioSwitcher {AppVersion()}"); return 0; }
                 if (args.Contains("--list-devices")) return ListDevices();
                 if (args.Contains("--dump-active"))   return DumpProps();
                 int miIdx = Array.IndexOf(args, "--make-icon");

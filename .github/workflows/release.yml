@@ -19,10 +19,14 @@ jobs:
           dotnet-version: '8.0.x'
 
       # Self-contained single-file exe: users run it with no .NET install required.
+      # Stamp the assembly version from the tag (v1.2.3 -> 1.2.3) so --version / the GUI match.
       - name: Publish (self-contained win-x64)
-        run: >
-          dotnet publish AudioSwitcher.csproj -c Release -r win-x64
-          --self-contained true -p:PublishSingleFile=true -o publish
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v',''
+          if ($ver -notmatch '^\d+\.\d+') { $ver = '0.0.0' }
+          dotnet publish AudioSwitcher.csproj -c Release -r win-x64 `
+            --self-contained true -p:PublishSingleFile=true -p:Version=$ver -o publish
 
       - name: Package
         shell: pwsh
