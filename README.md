@@ -9,18 +9,9 @@ automatically drops the rate *only* when a game needs it (many crash or go silen
 high rates), then restores it the moment you're done.
 
 [![build](https://github.com/thetrueartist/Audio-Switcher/actions/workflows/build.yml/badge.svg)](https://github.com/thetrueartist/Audio-Switcher/actions/workflows/build.yml)
-[![release](https://img.shields.io/github/v/release/thetrueartist/Audio-Switcher?sort=semver)](https://github.com/thetrueartist/Audio-Switcher/releases)
-[![license](https://img.shields.io/github/license/thetrueartist/Audio-Switcher)](LICENSE)
+[![release](https://img.shields.io/badge/release-latest-2ea043)](https://github.com/thetrueartist/Audio-Switcher/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
-
-```
-   ##  #  # ###  ###  ##   ### #   # ### ###  ### #  # #### ###
-  #  # #  # #  #  #  #  # #    #   #  #   #  #    #  # #    #  #
-  #### #  # #  #  #  #  #  ##  # # #  #   #  #    #### ###  ###
-  #  # #  # #  #  #  #  #    # ## ##  #   #  #    #  # #    # #
-  #  #  ##  ###  ###  ##  ###  #   # ###  #   ### #  # #### #  #
-                                              by @thetrueartist
-```
 
 </div>
 
