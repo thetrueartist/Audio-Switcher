@@ -2006,6 +2006,18 @@ namespace AudioSwitcher
                     Console.Error.WriteLine($"No audio endpoint for {which}. Run --list-devices.");
                     return 1;
                 }
+                // Single-instance guard: two daemons would fight over the ETW session, the named
+                // pipe and the format writes. If one is already running, don't start another.
+                if (AnotherInstanceRunning())
+                {
+                    string msg = "AudioSwitcher is already running (check the system tray).";
+                    if (args.Contains("--console") || args.Contains("--foreground"))
+                        Console.Error.WriteLine(msg + " Stop it first (tray -> Quit, or menu -> Stop).");
+                    else
+                        try { MessageBox.Show(msg, "AudioSwitcher", MessageBoxButtons.OK, MessageBoxIcon.Information); } catch { }
+                    return 0;
+                }
+
                 var daemon = new Daemon(cfg, ep, verbose);
                 // Default launch = system-tray app (what auto-start runs). --console / --foreground
                 // keep the classic blocking console daemon with a live colour log.
@@ -2027,6 +2039,18 @@ namespace AudioSwitcher
                 Console.Error.WriteLine(ex.StackTrace);
                 return 1;
             }
+        }
+
+        // True if another AudioSwitcher process (not us) is already running. Process-name
+        // enumeration works across integrity levels (elevated task daemon vs a normal double-click).
+        private static bool AnotherInstanceRunning()
+        {
+            try
+            {
+                var me = Process.GetCurrentProcess();
+                return Process.GetProcessesByName(me.ProcessName).Any(p => p.Id != me.Id);
+            }
+            catch { return false; }
         }
 
         private static int ListDevices()
