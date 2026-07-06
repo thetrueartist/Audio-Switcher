@@ -134,6 +134,27 @@ older version (the old one is kept as `config.json.old`). State files
 (`overrides.json`, `crash-log.json`, `glitch-log.json`) live in the same folder; delete
 the folder for a clean slate.
 
+## Update safety (signed releases)
+
+The in-app update check can require releases to be **cryptographically signed** so a
+compromised repo/account can't push a malicious update. Each release carries a
+`manifest.json` (version + SHA-256 of the zip) signed with the maintainer's **offline**
+ECDSA P-256 key; the app has the matching public key embedded and rejects any release
+whose manifest isn't validly signed (an attacker without the private key can't forge one).
+Pure .NET crypto, no third-party libs.
+
+Maintainer flow (the signing key never touches CI/GitHub):
+
+```powershell
+AudioSwitcher.exe --gen-signing-key         # once: writes AudioSwitcher-signing.key (keep OFFLINE), prints the public key to embed
+# per release, after the CI build:
+AudioSwitcher.exe --sign-release AudioSwitcher-win-x64.zip AudioSwitcher-signing.key 1.2.3
+# then attach manifest.json + manifest.sig to the GitHub release
+```
+
+Until a public key is embedded, the update check falls back to notify-only on the plain
+release tag.
+
 ## Anti-cheat
 
 The daemon never reads, writes, suspends, or injects into game processes. Format changes

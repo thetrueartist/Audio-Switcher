@@ -23,6 +23,7 @@ using System.Linq;
 using System.Management;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -1094,6 +1095,53 @@ namespace AudioSwitcher
     }
 
     // ====================================================================
+    // RELEASE SIGNING - ECDSA P-256, pure BCL. Protects auto-update against a
+    // compromised repo: only releases signed with the author's OFFLINE private key are
+    // trusted. Keep the private key off CI/GitHub - anything a compromised repo can reach.
+    // ====================================================================
+    public static class Signing
+    {
+        // Empty until the author embeds their public key (base64 SubjectPublicKeyInfo).
+        // Generate with --gen-signing-key. When empty, signature checks are skipped (the
+        // update check falls back to the plain release tag).
+        public const string PublicKeyB64 = "";
+
+        public static bool Enabled => PublicKeyB64.Length > 0;
+
+        public static (string priv, string pub) GenerateKeyPair()
+        {
+            using var ec = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+            return (Convert.ToBase64String(ec.ExportPkcs8PrivateKey()),
+                    Convert.ToBase64String(ec.ExportSubjectPublicKeyInfo()));
+        }
+
+        public static string Sign(byte[] data, string privB64)
+        {
+            using var ec = ECDsa.Create();
+            ec.ImportPkcs8PrivateKey(Convert.FromBase64String(privB64), out _);
+            return Convert.ToBase64String(ec.SignData(data, HashAlgorithmName.SHA256));
+        }
+
+        public static bool Verify(byte[] data, string sigB64)
+        {
+            try
+            {
+                if (!Enabled) return false;
+                using var ec = ECDsa.Create();
+                ec.ImportSubjectPublicKeyInfo(Convert.FromBase64String(PublicKeyB64), out _);
+                return ec.VerifyData(data, Convert.FromBase64String(sigB64), HashAlgorithmName.SHA256);
+            }
+            catch { return false; }
+        }
+
+        public static string Sha256Hex(byte[] data)
+        {
+            using var sha = SHA256.Create();
+            return Convert.ToHexString(sha.ComputeHash(data)).ToLowerInvariant();
+        }
+    }
+
+    // ====================================================================
     // UPDATE CHECK - queries the public GitHub Releases API (no auth), notify-only
     // ====================================================================
     public static class UpdateChecker
@@ -1105,6 +1153,11 @@ namespace AudioSwitcher
         static UpdateChecker() { _http.DefaultRequestHeaders.UserAgent.ParseAdd("AudioSwitcher-UpdateCheck"); }
 
         // Returns the latest release version (e.g. "1.2.0") if it's NEWER than 'current', else "".
+        // When release signing is enabled, ONLY a release carrying a validly-signed manifest is
+        // trusted - a compromised repo without the private key can't forge one, so no update is
+        // offered. Also exposes the signed sha256 of the download for a future verified install.
+        public static string VerifiedSha256 { get; private set; } = "";
+
         public static string NewerVersion(string current)
         {
             try
@@ -1113,6 +1166,26 @@ namespace AudioSwitcher
                 using var doc = JsonDocument.Parse(json);
                 string tag = doc.RootElement.GetProperty("tag_name").GetString() ?? "";
                 string latest = tag.TrimStart('v', 'V');
+
+                if (Signing.Enabled)
+                {
+                    string? mUrl = null, sUrl = null;
+                    if (doc.RootElement.TryGetProperty("assets", out var assets))
+                        foreach (var a in assets.EnumerateArray())
+                        {
+                            string name = a.GetProperty("name").GetString() ?? "";
+                            string url = a.GetProperty("browser_download_url").GetString() ?? "";
+                            if (name == "manifest.json") mUrl = url;
+                            else if (name == "manifest.sig") sUrl = url;
+                        }
+                    if (mUrl == null || sUrl == null) return "";   // unsigned release -> don't trust
+                    byte[] mBytes = _http.GetByteArrayAsync(mUrl).GetAwaiter().GetResult();
+                    string sig = _http.GetStringAsync(sUrl).GetAwaiter().GetResult().Trim();
+                    if (!Signing.Verify(mBytes, sig)) return "";   // bad signature -> reject
+                    using var mdoc = JsonDocument.Parse(mBytes);
+                    latest = (mdoc.RootElement.GetProperty("version").GetString() ?? latest).TrimStart('v', 'V');
+                    VerifiedSha256 = mdoc.RootElement.TryGetProperty("sha256", out var h) ? (h.GetString() ?? "") : "";
+                }
                 return IsNewer(latest, current) ? latest : "";
             }
             catch { return ""; }   // no network / rate-limited / parse fail -> silently skip
@@ -2227,6 +2300,10 @@ namespace AudioSwitcher
                         : $"Update available: v{v} (you have v{AppVersion()}).  {UpdateChecker.ReleasesPage}");
                     return 0;
                 }
+                if (args.Contains("--gen-signing-key"))    return GenSigningKey();
+                int sgIdx = Array.IndexOf(args, "--sign-release");
+                if (sgIdx >= 0 && sgIdx + 3 < args.Length)
+                    return SignRelease(args[sgIdx + 1], args[sgIdx + 2], args[sgIdx + 3]);
                 if (args.Contains("--list-devices")) return ListDevices();
                 if (args.Contains("--dump-active"))   return DumpProps();
                 int miIdx = Array.IndexOf(args, "--make-icon");
@@ -2518,6 +2595,45 @@ namespace AudioSwitcher
                 Console.Error.WriteLine($"Daemon not reachable: {ex.Message}");
                 return 1;
             }
+        }
+
+        // Generate an offline release-signing keypair. Run once, keep the .key file secret/offline,
+        // and paste the printed public key into Signing.PublicKeyB64.
+        private static int GenSigningKey()
+        {
+            var (priv, pub) = Signing.GenerateKeyPair();
+            string keyPath = Path.Combine(Directory.GetCurrentDirectory(), "AudioSwitcher-signing.key");
+            File.WriteAllText(keyPath, priv);
+            Console.WriteLine($"Private key written to: {keyPath}");
+            Console.WriteLine("KEEP THIS FILE OFFLINE AND SECRET - never commit it or put it in CI/GitHub.");
+            Console.WriteLine();
+            Console.WriteLine("Embed this public key in Signing.PublicKeyB64:");
+            Console.WriteLine(pub);
+            return 0;
+        }
+
+        // Sign a release asset (the .zip): writes manifest.json + manifest.sig to attach to the
+        // GitHub release. Run locally with your offline key, e.g.:
+        //   AudioSwitcher.exe --sign-release AudioSwitcher-win-x64.zip AudioSwitcher-signing.key 1.2.1
+        private static int SignRelease(string assetPath, string keyFile, string version)
+        {
+            try
+            {
+                byte[] asset = File.ReadAllBytes(assetPath);
+                string manifest = JsonSerializer.Serialize(new
+                {
+                    version = version.TrimStart('v', 'V'),
+                    asset = Path.GetFileName(assetPath),
+                    sha256 = Signing.Sha256Hex(asset)
+                });
+                string sig = Signing.Sign(Encoding.UTF8.GetBytes(manifest), File.ReadAllText(keyFile).Trim());
+                File.WriteAllText("manifest.json", manifest);
+                File.WriteAllText("manifest.sig", sig);
+                Console.WriteLine("Wrote manifest.json and manifest.sig.");
+                Console.WriteLine("Attach BOTH to the GitHub release (alongside the .zip).");
+                return 0;
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Sign failed: {ex.Message}"); return 1; }
         }
     }
 }
