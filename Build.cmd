@@ -1,6 +1,18 @@
 @echo off
 rem Double-click to compile AudioSwitcher. No PowerShell / execution-policy hassle.
 setlocal
+
+if not exist "%~dp0AudioSwitcher.csproj" (
+  echo.
+  echo   Looks like you are running this from inside the .zip.
+  echo   EXTRACT the whole zip first, then run Build.cmd from the
+  echo   extracted folder. ^(A release download is already compiled -
+  echo   you only need Build.cmd if you have the source.^)
+  echo.
+  pause
+  exit /b 1
+)
+
 where dotnet >nul 2>nul
 if errorlevel 1 (
   echo.

@@ -72,10 +72,16 @@ Formats your device doesn't support are skipped automatically.
 
 ## Build & install
 
+> **Extract the zip first.** Right-click the downloaded `.zip` → **Extract All**, then
+> run the `.cmd` from the extracted folder. Running a `.cmd` from *inside* the zip only
+> unpacks that one file, so it can't find the rest.
+
 Easiest — just double-click:
 
-- **`Build.cmd`** — compiles it (no PowerShell / execution-policy hassle).
-- **`Install.cmd`** — builds + enables auto-start (self-elevates to admin).
+- **`Install.cmd`** — installs + enables auto-start (self-elevates; from a release zip it
+  uses the bundled exe, from source it compiles). Re-running it cleanly reinstalls.
+- **`Uninstall.cmd`** — removes it (stops it, deletes the task + program files). Standalone.
+- **`Build.cmd`** — compiles from source only (you need the .NET SDK; not needed for releases).
 
 Once installed it runs at every logon and lives in your **system tray** (a small
 speaker icon: green = full quality, amber = lowered for a game, grey = paused).

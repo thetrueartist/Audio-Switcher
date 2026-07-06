@@ -164,6 +164,9 @@ function Ensure-Exe {
 
 function Install-Task {
     Assert-Admin
+    # Stop any running/old instance FIRST - otherwise the exe is locked (can't overwrite) and
+    # the single-instance guard would make the freshly-installed one exit immediately.
+    Stop-Daemon
     if (-not (Ensure-Exe)) { return }
 
     # Remove old task if it exists
@@ -225,7 +228,11 @@ function Start-Daemon {
 function Stop-Daemon {
     $procs = Get-Process -Name "AudioSwitcher" -ErrorAction SilentlyContinue
     if ($procs) {
-        $procs | Stop-Process -Force
+        foreach ($p in $procs) {
+            try { $p | Stop-Process -Force -ErrorAction Stop; $p.WaitForExit(4000) | Out-Null }
+            catch { Write-Host "  Could not stop pid $($p.Id) (try running as Administrator)." -ForegroundColor Yellow }
+        }
+        Start-Sleep -Milliseconds 300   # let the exe file unlock before any overwrite
         Write-Host "Daemon stopped." -ForegroundColor Yellow
     } else {
         Write-Host "Daemon was not running." -ForegroundColor DarkGray
