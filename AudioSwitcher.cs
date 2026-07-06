@@ -18,6 +18,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.IO.Pipes;
 using System.Linq;
 using System.Management;
@@ -1162,7 +1163,8 @@ namespace AudioSwitcher
         // When release signing is enabled, ONLY a release carrying a validly-signed manifest is
         // trusted - a compromised repo without the private key can't forge one, so no update is
         // offered. Also exposes the signed sha256 of the download for a future verified install.
-        public static string VerifiedSha256 { get; private set; } = "";
+        public static string VerifiedSha256 { get; private set; } = "";   // signed hash of the zip ("" if unsigned)
+        public static string ZipUrl { get; private set; } = "";           // download URL of the release zip
 
         public static string NewerVersion(string current)
         {
@@ -1173,17 +1175,19 @@ namespace AudioSwitcher
                 string tag = doc.RootElement.GetProperty("tag_name").GetString() ?? "";
                 string latest = tag.TrimStart('v', 'V');
 
+                string? mUrl = null, sUrl = null;
+                if (doc.RootElement.TryGetProperty("assets", out var assets))
+                    foreach (var a in assets.EnumerateArray())
+                    {
+                        string name = a.GetProperty("name").GetString() ?? "";
+                        string url = a.GetProperty("browser_download_url").GetString() ?? "";
+                        if (name == "manifest.json") mUrl = url;
+                        else if (name == "manifest.sig") sUrl = url;
+                        else if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) ZipUrl = url;
+                    }
+
                 if (Signing.Enabled)
                 {
-                    string? mUrl = null, sUrl = null;
-                    if (doc.RootElement.TryGetProperty("assets", out var assets))
-                        foreach (var a in assets.EnumerateArray())
-                        {
-                            string name = a.GetProperty("name").GetString() ?? "";
-                            string url = a.GetProperty("browser_download_url").GetString() ?? "";
-                            if (name == "manifest.json") mUrl = url;
-                            else if (name == "manifest.sig") sUrl = url;
-                        }
                     if (mUrl == null || sUrl == null) return "";   // unsigned release -> don't trust
                     byte[] mBytes = _http.GetByteArrayAsync(mUrl).GetAwaiter().GetResult();
                     string sig = _http.GetStringAsync(sUrl).GetAwaiter().GetResult().Trim();
@@ -1207,6 +1211,89 @@ namespace AudioSwitcher
                 if (x != y) return x > y;
             }
             return false;
+        }
+    }
+
+    // ====================================================================
+    // SELF-UPDATE - user-triggered one-click install. Verifies the signed SHA-256 (when
+    // signing is on), swaps the exe via rename (rollback-safe), and restarts via a helper.
+    // ====================================================================
+    public static class SelfUpdate
+    {
+        private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(5) };
+        static SelfUpdate() { _http.DefaultRequestHeaders.UserAgent.ParseAdd("AudioSwitcher-SelfUpdate"); }
+
+        // Downloads the zip, verifies its hash, and applies it. Returns "" on success (caller must
+        // then quit - the helper restarts the new exe), or an error string (nothing was changed).
+        public static string DownloadAndApply(string zipUrl, string expectedSha256, Action<string>? log = null)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(zipUrl)) return "no download URL";
+                string tmp = Path.Combine(Path.GetTempPath(), "AudioSwitcherUpdate");
+                Directory.CreateDirectory(tmp);
+                string zipPath = Path.Combine(tmp, "update.zip");
+                log?.Invoke("Downloading update...");
+                using (var resp = _http.GetAsync(zipUrl).GetAwaiter().GetResult())
+                {
+                    resp.EnsureSuccessStatusCode();
+                    using var fs = File.Create(zipPath);
+                    resp.Content.CopyToAsync(fs).GetAwaiter().GetResult();
+                }
+                return Apply(zipPath, expectedSha256, log);
+            }
+            catch (Exception ex) { return ex.Message; }
+        }
+
+        // Verify + swap from a local zip (also used by --apply-update for isolated testing).
+        public static string Apply(string zipPath, string expectedSha256, Action<string>? log = null)
+        {
+            try
+            {
+                byte[] bytes = File.ReadAllBytes(zipPath);
+                string sha = Signing.Sha256Hex(bytes);
+                if (!string.IsNullOrEmpty(expectedSha256) &&
+                    !sha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+                    return $"SHA-256 mismatch - update REJECTED (expected {expectedSha256}, got {sha})";
+                if (string.IsNullOrEmpty(expectedSha256))
+                    log?.Invoke("[warn] no signed hash to verify against (signing not enabled) - trusting TLS only");
+
+                string extract = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(zipPath))!, "extracted");
+                if (Directory.Exists(extract)) Directory.Delete(extract, true);
+                ZipFile.ExtractToDirectory(zipPath, extract);
+                string newExe = Path.Combine(extract, "AudioSwitcher.exe");
+                if (!File.Exists(newExe)) return "AudioSwitcher.exe not found in the update zip";
+
+                string curExe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                if (string.IsNullOrEmpty(curExe) || !File.Exists(curExe)) return "cannot locate the running exe";
+                string oldExe = curExe + ".old";
+
+                // Windows allows RENAMING a running exe (but not overwriting it). Rename current out
+                // of the way, copy the new one in. On any failure, rename back (rollback).
+                try { if (File.Exists(oldExe)) File.Delete(oldExe); } catch { }
+                File.Move(curExe, oldExe);
+                try { File.Copy(newExe, curExe, true); }
+                catch (Exception ex)
+                {
+                    try { if (!File.Exists(curExe)) File.Move(oldExe, curExe); } catch { }
+                    return "swap failed (rolled back): " + ex.Message;
+                }
+
+                // Helper: wait for THIS process to exit, then start the new exe and remove .old.
+                int pid = Process.GetCurrentProcess().Id;
+                string helper = Path.Combine(Path.GetTempPath(), "AudioSwitcherUpdate", "restart.cmd");
+                File.WriteAllText(helper,
+                    "@echo off\r\n" +
+                    ":wait\r\n" +
+                    $"tasklist /fi \"PID eq {pid}\" | find \"{pid}\" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n" +
+                    $"schtasks /run /tn AudioSwitcherDaemon >nul 2>nul || start \"\" \"{curExe}\"\r\n" +
+                    $"del \"{oldExe}\" >nul 2>nul\r\n");
+                Process.Start(new ProcessStartInfo { FileName = helper, UseShellExecute = true,
+                    CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden });
+                log?.Invoke("Update applied - restarting.");
+                return "";
+            }
+            catch (Exception ex) { return ex.Message; }
         }
     }
 
@@ -1977,8 +2064,7 @@ namespace AudioSwitcher
             void OpenWindow() => MainWindow.ShowSingleton(daemon);
             open.Click += (_, __) => OpenWindow();
             tray.DoubleClick += (_, __) => OpenWindow();
-            void OpenReleases() { try { Process.Start(new ProcessStartInfo { FileName = UpdateChecker.ReleasesPage, UseShellExecute = true }); } catch { } }
-            update.Click += (_, __) => OpenReleases();
+            update.Click += (_, __) => MainWindow.ShowAndInstall(daemon);
             pause.Click += (_, __) => { daemon.SetPaused(!daemon.Paused); };
             logs.Click += (_, __) =>
             {
@@ -2021,7 +2107,7 @@ namespace AudioSwitcher
                 // Update notification (set by the background check).
                 if (!string.IsNullOrEmpty(daemon.UpdateVersion))
                 {
-                    update.Text = $"Update available: v{daemon.UpdateVersion}  (click to get it)";
+                    update.Text = $"Update available: v{daemon.UpdateVersion}  (click to install)";
                     update.Visible = true;
                     if (!updateNotified)
                     {
@@ -2113,6 +2199,44 @@ namespace AudioSwitcher
             _instance.BringToFront();
         }
 
+        public static void ShowAndInstall(Daemon d) { ShowSingleton(d); _instance?.DoInstall(); }
+
+        private bool _installing;
+        public void DoInstall()
+        {
+            if (_installing || string.IsNullOrEmpty(_d.UpdateVersion)) return;
+            // No download URL (e.g. no zip asset / signing rejected) -> fall back to the release page.
+            if (string.IsNullOrEmpty(UpdateChecker.ZipUrl))
+            {
+                try { Process.Start(new ProcessStartInfo { FileName = UpdateChecker.ReleasesPage, UseShellExecute = true }); } catch { }
+                return;
+            }
+            if (MessageBox.Show(this, $"Download and install v{_d.UpdateVersion}?\nAudioSwitcher will restart.",
+                "Install update", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            _installing = true;
+            _lblUpdate.Text = "Downloading update...";
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                string err = SelfUpdate.DownloadAndApply(UpdateChecker.ZipUrl, UpdateChecker.VerifiedSha256,
+                    m => { try { BeginInvoke(new Action(() => _lblUpdate.Text = m)); } catch { } });
+                try
+                {
+                    BeginInvoke(new Action(() =>
+                    {
+                        if (err == "") { _d.RequestShutdown(); Application.Exit(); }   // helper restarts the new exe
+                        else
+                        {
+                            _installing = false;
+                            _lblUpdate.Text = $"Update available: v{_d.UpdateVersion} - click to install";
+                            MessageBox.Show(this, "Update failed:\n" + err, "AudioSwitcher",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                    }));
+                }
+                catch { }
+            });
+        }
+
         private readonly Daemon _d;
         private readonly Label _lblDevice = Lbl(), _lblFormat = Lbl(), _lblState = Lbl();
         private readonly ListBox _games = new() { IntegralHeight = false };
@@ -2151,7 +2275,7 @@ namespace AudioSwitcher
                 Location = new Point(x + 2, y + 30) };
             Controls.Add(by);
             _lblUpdate.Location = new Point(x + 2, y + 48);
-            _lblUpdate.Click += (_, __) => { try { Process.Start(new ProcessStartInfo { FileName = UpdateChecker.ReleasesPage, UseShellExecute = true }); } catch { } };
+            _lblUpdate.Click += (_, __) => DoInstall();
             Controls.Add(_lblUpdate);
             y += 58;
 
@@ -2214,7 +2338,7 @@ namespace AudioSwitcher
 
             if (!string.IsNullOrEmpty(_d.UpdateVersion))
             {
-                _lblUpdate.Text = $"Update available: v{_d.UpdateVersion} - click to download";
+                _lblUpdate.Text = $"Update available: v{_d.UpdateVersion} - click to install";
                 _lblUpdate.Visible = true;
             }
             else _lblUpdate.Visible = false;
@@ -2308,6 +2432,15 @@ namespace AudioSwitcher
                         ? $"Up to date (v{AppVersion()})."
                         : $"Update available: v{v} (you have v{AppVersion()}).  {UpdateChecker.ReleasesPage}");
                     return 0;
+                }
+                int auIdx = Array.IndexOf(args, "--apply-update");
+                if (auIdx >= 0 && auIdx + 1 < args.Length)
+                {
+                    // Test the swap in isolation with a local zip (optional 3rd arg = expected sha256).
+                    string sha = auIdx + 2 < args.Length && !args[auIdx + 2].StartsWith("--") ? args[auIdx + 2] : "";
+                    string err = SelfUpdate.Apply(args[auIdx + 1], sha, Console.WriteLine);
+                    Console.WriteLine(err == "" ? "OK - restarting shortly." : "FAILED: " + err);
+                    return err == "" ? 0 : 1;
                 }
                 if (args.Contains("--gen-signing-key"))    return GenSigningKey();
                 int sgIdx = Array.IndexOf(args, "--sign-release");

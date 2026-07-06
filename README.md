@@ -136,6 +136,11 @@ the folder for a clean slate.
 
 ## Update safety (signed releases)
 
+When an update is available, the tray/GUI shows **"Update available — click to install"**;
+clicking it does a **user-triggered** one-click install: download the zip, verify its
+SHA-256 against the signed manifest, swap the exe (rename-based, with rollback), and
+restart. It never installs silently on its own - you choose when.
+
 The in-app update check can require releases to be **cryptographically signed** so a
 compromised repo/account can't push a malicious update. Each release carries a
 `manifest.json` (version + SHA-256 of the zip) signed with the maintainer's **offline**
