@@ -40,8 +40,9 @@ game, exactly when a game needs it — automatically.
   re-tests whether a game can go higher, to find the true ceiling.
 - **System-tray app + GUI control panel** — live status, running games, per-game
   profiles, pause, and auto-start toggle.
-- **Anti-cheat safe by default.** Never reads, writes, or injects into game processes. (One
-  *opt-in, off-by-default* feature briefly suspends a game to nail the switch — for offline titles.)
+- **Anti-cheat safe.** Never reads, writes, or injects into game processes. To nail the switch it
+  briefly suspends the game across the format change — but auto-skips that the moment a known
+  anti-cheat driver (EAC/BattlEye/Vanguard/…) is loaded, so it only ever fires on offline titles.
 - **No third-party dependencies.** Pure Windows API (P/Invoke + COM). Releases are a
   self-contained exe — no .NET install required.
 
@@ -133,12 +134,14 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
   peak meter reads sound before ever acting (a broken meter can't misfire). 0 = off.
   `SilenceGraceSeconds` ignores the first N seconds (loading).
 - `ProbeEveryLaunches` — **0 = off**; set e.g. `5` to enable the upward probe.
-- `SuspendDuringSwitch` — **off by default.** For a *known* game (already learned or known-quirky),
+- `SuspendDuringSwitch` — **on by default.** For a *known* game (already learned or known-quirky),
   freeze it the instant it launches, change the format, then resume — so it can't open its audio
   device at the old rate before the switch lands. Guarantees the switch wins the race even for games
-  that init audio the moment they start. Set `true` **only for offline/single-player games**: it
-  suspends the process (documented ntdll suspend, no injection), which a running anti-cheat could
-  flag. The always-on fast-apply already handles most games; this is for the stubborn ones.
+  that init audio the moment they start (documented ntdll suspend, no injection). Stays safe via:
+- `SuspendSkipIfAntiCheat` — **on by default.** Before freezing, check for a loaded anti-cheat
+  *kernel driver* (EAC, BattlEye, Vanguard, …); if one is present, skip the freeze entirely (the
+  fast-apply still runs). So the freeze only ever fires on offline titles, and online/anti-cheat
+  games are never suspended. Set `false` only if you want the freeze unconditionally.
 
 Config is validated on load (bad values can't crash it) and regenerated if it's from an
 older version (the old one is kept as `config.json.old`). State files
@@ -177,11 +180,13 @@ By default the daemon never reads, writes, suspends, or injects into game proces
 changes go through the Windows audio service; detection is WMI/ETW observation. EAC/BattlEye/VAC
 have nothing to react to.
 
-The **one** exception is opt-in and off by default: `SuspendDuringSwitch` briefly suspends a
-*known* game across the format switch (documented ntdll process suspend — still no memory access,
-no injection, no hooking) so it can't open audio at the wrong rate first. Suspending a process is
-the one thing an anti-cheat could object to, so leave it off for online games; enable it only for
-offline/single-player titles. The default path stays fully hands-off.
+The **one** thing that touches a game is `SuspendDuringSwitch` (on by default): it briefly suspends
+a *known* game across the format switch (documented ntdll process suspend — still no memory access,
+no injection, no hooking) so it can't open audio at the wrong rate first. Because suspending a
+protected game is the one thing an anti-cheat could object to, it's gated by `SuspendSkipIfAntiCheat`
+(also on by default): if a known anti-cheat kernel driver (EAC/BattlEye/Vanguard/…) is loaded, the
+freeze is skipped and only the hands-off fast-apply runs. Net result: the freeze fires only on
+offline titles; online/anti-cheat games are never suspended.
 
 ## FAQ
 

@@ -47,7 +47,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 8;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 9;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public bool CheckForUpdates { get; set; } = true;    // check GitHub Releases at startup (notify only)
         public int Channels { get; set; } = 2;
@@ -76,11 +76,17 @@ namespace AudioSwitcher
         // that's known-quirky) launches, suspend all its threads, change the device format, then
         // resume - so it physically cannot open its audio device at the old rate before the switch
         // lands. Guarantees the switch wins the race (the game isn't running while we change it).
-        // OFF by default: suspending a process is the one thing an anti-cheat could object to, so
-        // enable it only for offline/single-player titles (e.g. Hotline Miami). Uses documented
-        // ntdll process suspend - no injection, no hooking. The fast-apply path is always on; this
-        // just adds the freeze for the cases where even a fast apply loses the race.
-        public bool SuspendDuringSwitch { get; set; } = false;
+        // ON by default - it's the only thing that reliably beats a game that opens audio the instant
+        // it starts. Safe because of SuspendSkipIfAntiCheat below. Uses documented ntdll process
+        // suspend - no injection, no hooking. The fast-apply path is always on regardless.
+        public bool SuspendDuringSwitch { get; set; } = true;
+        // Safety gate for the freeze: skip suspending if a known anti-cheat KERNEL DRIVER is loaded
+        // (EAC, BattlEye, Vanguard, ...). Suspending a protected game is the one thing an anti-cheat
+        // could read as tampering, so with this on (default) the freeze auto-disables itself for
+        // online/anti-cheat titles and only ever fires on offline games - fast-apply still runs for
+        // the protected ones. Set false only if you know your game has no anti-cheat and want the
+        // freeze unconditionally.
+        public bool SuspendSkipIfAntiCheat { get; set; } = true;
 
         public List<ProfileTier> ProfileTiers { get; set; } = new()
         {
@@ -1424,6 +1430,47 @@ namespace AudioSwitcher
             try { NtResumeProcess(handle); } catch { }
             try { CloseHandle(handle); } catch { }
         }
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        static extern bool EnumDeviceDrivers(IntPtr[]? addresses, int cb, out int cbNeeded);
+        [DllImport("psapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern int GetDeviceDriverBaseName(IntPtr address, StringBuilder name, int size);
+
+        // Known anti-cheat kernel drivers. These are the ACs that actually watch for tampering
+        // (kernel Ob-callbacks); if one is loaded we must NOT suspend the game. Matched as a
+        // substring of each loaded driver's base name, case-insensitively.
+        static readonly string[] AntiCheatDrivers =
+        {
+            "EasyAntiCheat", "BEDaisy", "BattlEye", "vgk",   // EAC, BattlEye, Riot Vanguard
+            "mhyprot",                                        // miHoYo (Genshin/HSR/ZZZ)
+            "xhunter1", "TFSysMon", "SGuard",                 // XIGNCODE3, nProtect, others
+        };
+
+        // Returns the name of a loaded anti-cheat driver, or null if none. Cheap (one syscall +
+        // a name lookup per driver). On any failure returns null (fail-open) - the caller logs the
+        // outcome either way, so a user on an anti-cheat title can still see what happened.
+        public static string? AntiCheatDriverLoaded()
+        {
+            try
+            {
+                if (!EnumDeviceDrivers(null, 0, out int need) || need <= 0) return null;
+                var addrs = new IntPtr[need / IntPtr.Size];
+                if (!EnumDeviceDrivers(addrs, need, out _)) return null;
+                var sb = new StringBuilder(260);
+                foreach (var addr in addrs)
+                {
+                    if (addr == IntPtr.Zero) continue;
+                    sb.Clear();
+                    if (GetDeviceDriverBaseName(addr, sb, sb.Capacity) == 0) continue;
+                    string dn = sb.ToString();
+                    foreach (var ac in AntiCheatDrivers)
+                        if (dn.IndexOf(ac, StringComparison.OrdinalIgnoreCase) >= 0)
+                            return dn;
+                }
+            }
+            catch { }
+            return null;
+        }
     }
 
     public class Daemon
@@ -1676,12 +1723,24 @@ namespace AudioSwitcher
             }
             Log($"+ {exe}  [{reason} | {engine} | tier {tier} {source}]");
 
-            // Optionally freeze the game across the switch so it physically cannot open audio at the
-            // old rate before the new format is live. Opt-in (anti-cheat-unsafe); known games only,
-            // since we resolve their rate instantly. Suspend is best-effort - if it fails we still
-            // apply. ApplyEffective is synchronous, so the freeze lasts only the ~tens-of-ms switch.
-            IntPtr frozen = (allowSuspend && _config.SuspendDuringSwitch) ? ProcessControl.Suspend(pid) : IntPtr.Zero;
-            if (frozen != IntPtr.Zero) Log($"  froze {exe} across switch");
+            // Freeze the game across the switch so it physically cannot open audio at the old rate
+            // before the new format is live (known games only - we resolve their rate instantly).
+            // On by default, but auto-skipped when an anti-cheat driver is loaded so it never fires
+            // on a protected online title. Best-effort - if suspend fails we still apply. The freeze
+            // lasts only the ~tens-of-ms synchronous switch.
+            IntPtr frozen = IntPtr.Zero;
+            if (allowSuspend && _config.SuspendDuringSwitch)
+            {
+                string? ac = _config.SuspendSkipIfAntiCheat ? ProcessControl.AntiCheatDriverLoaded() : null;
+                if (ac != null)
+                    Log($"  not freezing {exe}: anti-cheat driver loaded ({ac})");
+                else
+                {
+                    frozen = ProcessControl.Suspend(pid);
+                    Log(frozen != IntPtr.Zero ? $"  froze {exe} across switch"
+                                              : $"  freeze failed for {exe} (applying anyway)");
+                }
+            }
             try { ApplyEffective(); }
             finally { ProcessControl.Resume(frozen); }
         }
