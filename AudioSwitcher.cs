@@ -2567,11 +2567,22 @@ namespace AudioSwitcher
         {
             var sessions = EndpointManager.GetSessions();
             if (sessions.Count == 0) { Console.WriteLine("(no audio sessions on the default render endpoint)"); return 0; }
+            float maxPeak = 0;
             foreach (var s in sessions)
             {
                 string st = s.State == 1 ? "Active" : s.State == 2 ? "Expired" : "Inactive";
-                Console.WriteLine($"  pid={s.Pid,-7} {st,-8} peak={s.Peak:F4}");
+                string name = "?";
+                try { using var p = Process.GetProcessById((int)s.Pid); name = p.ProcessName + ".exe"; }
+                catch { name = s.Pid == 0 ? "(system)" : "(unknown)"; }
+                if (s.Peak > maxPeak) maxPeak = s.Peak;
+                Console.WriteLine($"  pid={s.Pid,-7} {st,-8} peak={s.Peak:F4}  {name}");
             }
+            Console.WriteLine();
+            Console.WriteLine(maxPeak > 0.0005f
+                ? $"  Peak meter WORKS (saw {maxPeak:F4}). Silence detection can run."
+                : "  All peaks 0 - either nothing is playing, OR the meter can't read. Re-run WHILE audio plays:");
+            if (maxPeak <= 0.0005f)
+                Console.WriteLine("    if a playing app STILL shows 0, the meter is the problem (not silence).");
             return 0;
         }
 
