@@ -1730,13 +1730,18 @@ namespace AudioSwitcher
                         {
                             if (g.SawAudio) continue;
                             if ((now - g.StartedAt).TotalSeconds < _config.SilenceGraceSeconds) continue;
-                            var s = sessions.FirstOrDefault(x => x.Pid == (uint)g.Pid);
-                            if (s.State == 1 && s.Peak > 0.0005f) { g.SawAudio = true; g.SilentSince = null; continue; }
-                            if (!(s.State == 1 && s.Peak <= 0.0005f)) { g.SilentSince = null; continue; }  // no Active session -> don't flag
+                            var matches = sessions.Where(x => x.Pid == (uint)g.Pid).ToList();
+                            if (matches.Count == 0) { g.SilentSince = null; continue; }   // no audio session -> can't judge
+                            var s = matches[0];
+                            if (s.State == 1 && s.Peak > 0.0005f) { g.SawAudio = true; g.SilentSince = null; continue; }  // has sound
+                            // A session exists but isn't producing sound: Active-but-silent, OR Inactive
+                            // (its stream never started - how older games fail at a rate they can't handle).
+                            // Both count as silent.
                             g.SilentSince ??= now;
                             if ((now - g.SilentSince.Value).TotalSeconds >= _config.SilenceWindowSeconds && _meterEverPositive)
                             {
-                                Log($"! {g.Exe}: session Active but silent {_config.SilenceWindowSeconds}s -> format likely unusable");
+                                string how = s.State == 1 ? "session Active but silent" : "session never started (Inactive)";
+                                Log($"! {g.Exe}: {how} {_config.SilenceWindowSeconds}s -> format likely unusable");
                                 g.Failed = true;
                                 if (BumpProfileDown(g.Exe, g.Engine, "running but silent"))
                                 {
