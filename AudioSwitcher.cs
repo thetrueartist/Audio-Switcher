@@ -1808,6 +1808,19 @@ namespace AudioSwitcher
             try { tray.BalloonTipTitle = "AudioSwitcher running";
                   tray.BalloonTipText = $"Managing {daemon.DeviceName}"; tray.ShowBalloonTip(3000); } catch { }
 
+            // First run (e.g. just after Install) -> open the control panel so the user sees the GUI.
+            // A marker file gates it so it doesn't pop up at every logon.
+            try
+            {
+                string marker = Path.Combine(StateStore.ConfigDir, ".gui-shown");
+                if (!File.Exists(marker))
+                {
+                    File.WriteAllText(marker, "shown");
+                    MainWindow.ShowSingleton(daemon);
+                }
+            }
+            catch { }
+
             Application.Run();   // pumps messages until Application.Exit()
             tray.Dispose();
         }

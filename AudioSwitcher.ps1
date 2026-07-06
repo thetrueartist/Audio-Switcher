@@ -188,6 +188,9 @@ function Install-Task {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
 
+    # Clear the "gui shown" marker so the control panel pops up once after (re)install.
+    Remove-Item (Join-Path $env:LOCALAPPDATA "AudioSwitcher\.gui-shown") -Force -ErrorAction SilentlyContinue
+
     Write-Host "Starting daemon now..." -ForegroundColor Cyan
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 2
