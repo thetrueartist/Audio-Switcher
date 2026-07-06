@@ -117,6 +117,10 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
 - `LauncherProcesses` / `GamePathHints` — how games are detected. `GameProcesses` — exe
   names always treated as games (add any game here, e.g. a Store/UWP or portable game).
   `IgnoreProcesses` — never games (launcher helpers, non-game Store apps).
+- `AutoLearnFullscreenSeconds` — **auto-learn** (default 15; 0 = off): an exclusive-fullscreen
+  Direct3D app that isn't already known gets added to `GameProcesses` after this long, so its
+  next launch is caught early. Low false-positive (only exclusive fullscreen, which browsers/
+  video don't use), and a false-add is harmless (the app is tracked, not altered).
 - `CrashThresholdSeconds`, `GlitchThreshold`, `GlitchWindowSeconds` — learning sensitivity.
 - `SilenceWindowSeconds` — **0 = off**; set e.g. `15` to enable silence learning (verify
   with `--sessions` first). `SilenceGraceSeconds` ignores the first N seconds (loading).

@@ -44,7 +44,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 4;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 5;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public int Channels { get; set; } = 2;
         public int IdleTier { get; set; } = 0;
@@ -57,6 +57,12 @@ namespace AudioSwitcher
         // e.g. 15 once `--sessions` confirms it reads your games' peak meter.
         public int SilenceWindowSeconds { get; set; } = 0;
         public int SilenceGraceSeconds { get; set; } = 25;
+        // Auto-learn games: if an EXCLUSIVE-fullscreen Direct3D app (a strong, low-false-positive
+        // "this is a game" signal - browsers/video/desktop apps don't use exclusive fullscreen)
+        // stays foreground this long and isn't already known, add its exe to GameProcesses so
+        // future launches are caught at start. 0 = off. Even a rare false-add is harmless - the
+        // app just gets tracked, never altered unless it actually crashes/glitches.
+        public int AutoLearnFullscreenSeconds { get; set; } = 15;
         // Upward probe: every Nth launch of a game we've previously dropped, retry ONE tier
         // higher to find the true ceiling / self-heal over-drops. 0 = OFF (default) - a game
         // with a genuine limit will fail on the probe launch, so it's opt-in.
@@ -997,6 +1003,7 @@ namespace AudioSwitcher
             if (c.GlitchWindowSeconds < 1) c.GlitchWindowSeconds = d.GlitchWindowSeconds;
             if (c.SilenceWindowSeconds < 0) c.SilenceWindowSeconds = 0;
             if (c.SilenceGraceSeconds < 0) c.SilenceGraceSeconds = d.SilenceGraceSeconds;
+            if (c.AutoLearnFullscreenSeconds < 0) c.AutoLearnFullscreenSeconds = 0;
             c.EngineDefaults ??= d.EngineDefaults;
             c.LauncherProcesses ??= d.LauncherProcesses;
             c.GamePathHints ??= d.GamePathHints;
@@ -1085,6 +1092,36 @@ namespace AudioSwitcher
     }
 
     // ====================================================================
+    // FULLSCREEN GAME DETECTION - low-FP "this is a game" signal for auto-learn
+    // ====================================================================
+    public static class Foreground
+    {
+        [DllImport("shell32.dll")] private static extern int SHQueryUserNotificationState(out int state);
+        [DllImport("user32.dll")]  private static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]  private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+        private const int QUNS_RUNNING_D3D_FULL_SCREEN = 6;
+
+        // Exe name of the foreground process IF an exclusive-fullscreen Direct3D app is running,
+        // else "". Exclusive fullscreen is a strong game signal - browsers/video/desktop apps
+        // composite in windowed/borderless mode and never report this state.
+        public static string FullscreenGameExe()
+        {
+            try
+            {
+                if (SHQueryUserNotificationState(out int st) != 0 || st != QUNS_RUNNING_D3D_FULL_SCREEN)
+                    return "";
+                IntPtr hwnd = GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return "";
+                GetWindowThreadProcessId(hwnd, out uint pid);
+                if (pid == 0) return "";
+                using var p = Process.GetProcessById((int)pid);
+                return p.ProcessName + ".exe";
+            }
+            catch { return ""; }
+        }
+    }
+
+    // ====================================================================
     // MAIN DAEMON
     // ====================================================================
     public class RunningGame
@@ -1117,6 +1154,7 @@ namespace AudioSwitcher
         private readonly ManualResetEventSlim _shutdown = new(false);
         private Thread? _glitchThread;
         private Thread? _ipcThread;
+        private Thread? _autoLearnThread;
 
         public Daemon(Config config, AudioEndpoint endpoint, bool verbose)
         {
@@ -1213,6 +1251,8 @@ namespace AudioSwitcher
             _glitchThread.Start();
             _ipcThread = new Thread(IpcServer) { IsBackground = true, Name = "IPC" };
             _ipcThread.Start();
+            _autoLearnThread = new Thread(AutoLearnPump) { IsBackground = true, Name = "AutoLearn" };
+            _autoLearnThread.Start();
 
             Log("Active. Ctrl-C to exit.");
             Log("");
@@ -1474,6 +1514,51 @@ namespace AudioSwitcher
         }
 
         private DateTime _lastSilenceCheck = DateTime.MinValue;
+
+        // Auto-learn: watch for an exclusive-fullscreen D3D app that isn't already known, and after
+        // it stays foreground long enough, add its exe to GameProcesses so its NEXT launch is caught
+        // at process-start (this session was detected too late to manage without disrupting audio).
+        private void AutoLearnPump()
+        {
+            string candidate = ""; DateTime since = DateTime.MinValue;
+            while (!_shutdown.IsSet)
+            {
+                if (_shutdown.Wait(2000)) break;
+                if (_config.AutoLearnFullscreenSeconds <= 0) { candidate = ""; continue; }
+
+                string exe = Foreground.FullscreenGameExe();
+                if (string.IsNullOrEmpty(exe)) { candidate = ""; continue; }
+
+                bool known = _config.GameProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase))
+                          || _config.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+                if (known) { candidate = ""; continue; }
+
+                if (!string.Equals(exe, candidate, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidate = exe; since = DateTime.Now; continue;   // start timing this exe
+                }
+                if ((DateTime.Now - since).TotalSeconds >= _config.AutoLearnFullscreenSeconds)
+                {
+                    LearnGameProcess(exe);
+                    candidate = "";   // don't immediately re-learn
+                }
+            }
+        }
+
+        private void LearnGameProcess(string exe)
+        {
+            try
+            {
+                var cfg = StateStore.LoadConfig();   // load fresh so we don't clobber the user's edits
+                if (cfg.GameProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase))) return;
+                cfg.GameProcesses.Add(exe);
+                StateStore.Save(cfg, StateStore.ConfigFile);
+                if (!_config.GameProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase)))
+                    _config.GameProcesses.Add(exe);   // reflect immediately in the running daemon
+                Log($"Learned '{exe}' as a game (exclusive fullscreen) - it'll be managed from its next launch.");
+            }
+            catch (Exception ex) { if (_verbose) Log($"[warn] auto-learn: {ex.Message}"); }
+        }
 
         private (int rate, int bits, int tier, string source) ResolveProfile(string exe, string engine)
         {
