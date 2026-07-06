@@ -850,12 +850,16 @@ namespace AudioSwitcher
     // ====================================================================
     public static class GameDetection
     {
-        public static (bool isGame, string reason)? IsGame(string exePath, int parentPid, Config cfg)
+        // procName = the process image name from WMI (always available, e.g. "Minecraft.Windows.exe");
+        // exePath = the full path (may be "" for UWP/protected processes we can't read).
+        public static (bool isGame, string reason)? IsGame(string exePath, string procName, int parentPid, Config cfg)
         {
-            if (string.IsNullOrEmpty(exePath)) return null;
+            // Prefer the WMI process name for name checks - it works even when the path is unreadable.
+            string fileName = !string.IsNullOrEmpty(procName) ? procName
+                            : (!string.IsNullOrEmpty(exePath) ? Path.GetFileName(exePath) : "");
+            if (string.IsNullOrEmpty(fileName) && string.IsNullOrEmpty(exePath)) return null;
 
             // Denylist first: launcher helpers / crash handlers / non-game Store apps are never games.
-            string fileName = Path.GetFileName(exePath);
             if (cfg.IgnoreProcesses.Any(n => string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase)))
                 return null;
 
@@ -863,11 +867,13 @@ namespace AudioSwitcher
             if (cfg.GameProcesses.Any(n => string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase)))
                 return (true, $"name:{fileName}");
 
-            foreach (var hint in cfg.GamePathHints)
-            {
-                if (exePath.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
-                    return (true, $"path:{hint}");
-            }
+            // Path hints only apply when we actually have a path.
+            if (!string.IsNullOrEmpty(exePath))
+                foreach (var hint in cfg.GamePathHints)
+                {
+                    if (exePath.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
+                        return (true, $"path:{hint}");
+                }
 
             if (parentPid > 0)
             {
@@ -1411,11 +1417,14 @@ namespace AudioSwitcher
                 string exe = e.NewEvent.Properties["ProcessName"].Value?.ToString() ?? "";
 
                 Thread.Sleep(250);
-                string path;
+                string path = "";
+                // UWP/Store games (e.g. Minecraft Bedrock) run in an AppContainer - MainModule is
+                // unreadable even elevated. Don't bail: fall back to the WMI process name so the
+                // GameProcesses/IgnoreProcesses name checks still work.
                 try { using var proc = Process.GetProcessById(pid); path = proc.MainModule?.FileName ?? ""; }
-                catch { return; }
+                catch { }
 
-                var detection = GameDetection.IsGame(path, ppid, _config);
+                var detection = GameDetection.IsGame(path, exe, ppid, _config);
                 if (detection == null) return;
 
                 // Fast path: if we already know this game (learned override or known-quirky), use
