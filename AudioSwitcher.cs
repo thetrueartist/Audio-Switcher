@@ -228,6 +228,13 @@ namespace AudioSwitcher
         // (AudioSes.dll), so the event PID is the game's and it carries the Initialize HRESULT.
         // GUID verified = SHA1 name-hash of "Microsoft.Windows.Audio.Client".
         public static readonly Guid AudioClientProvider = new("6e7b1892-5288-5fe5-8f34-e3b0dc671fd2");
+        // Microsoft-Windows-Kernel-Process - fires on process CREATE within ~1ms (vs WMI's ~1s), so
+        // we can drop the format for a game we already know BEFORE it opens its audio device instead
+        // of a second later. Enabled with keyword 0x10 (WINEVENT_KEYWORD_PROCESS); event Id 1 =
+        // ProcessStart, and the new PID is the first payload field (UInt32). OnProcessStartFast is
+        // set by the daemon and invoked on the ETW thread with that PID.
+        public static readonly Guid KernelProcessProvider = new("22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716");
+        public static Action<int>? OnProcessStartFast;
         private const string SessionName = "AudioSwitcherSession";
 
         public static ConcurrentQueue<GlitchEvent> Events { get; } = new();
@@ -419,6 +426,20 @@ namespace AudioSwitcher
             Marshal.FreeHGlobal(propsPtr);
             if (rc != 0) throw new InvalidOperationException($"EnableTraceEx2 failed: {rc}");
 
+            // Also enable the kernel process provider for near-instant launch detection (keyword
+            // 0x10 = WINEVENT_KEYWORD_PROCESS, Info level). Best-effort: if it fails we still have
+            // WMI-speed detection, so don't abort the session over it.
+            if (OnProcessStartFast != null)
+            {
+                try
+                {
+                    Guid kp = KernelProcessProvider;
+                    EnableTraceEx2(_sessionHandle, ref kp, EVENT_CONTROL_CODE_ENABLE,
+                        5, 0x10, 0, 0, IntPtr.Zero);
+                }
+                catch { }
+            }
+
             // Optionally also enable a second provider (diagnostic: the Audio.Client provider),
             // at Verbose so we see every init event on this session.
             if (_extraProvider.HasValue)
@@ -452,6 +473,22 @@ namespace AudioSwitcher
 
         private static void OnEvent(ref EVENT_RECORD record)
         {
+            // Kernel process-start: route to the fast launch handler and stop. These are Info-level
+            // (4) and would otherwise be dropped by the glitch level filter below; they must never
+            // be counted as audio glitches. Id 1 = ProcessStart; the new PID is the first payload
+            // field (UInt32) - a stable offset across Windows versions, unlike the later fields.
+            if (record.EventHeader.ProviderId == KernelProcessProvider)
+            {
+                var cb = OnProcessStartFast;
+                if (cb != null && record.EventHeader.Id == 1 &&
+                    record.UserDataLength >= 4 && record.UserData != IntPtr.Zero)
+                {
+                    int pid = Marshal.ReadInt32(record.UserData);
+                    if (pid > 0) { try { cb(pid); } catch { } }
+                }
+                return;
+            }
+
             // Diagnostic: raw-capture the extra (Audio.Client) provider's events with payload.
             if (_captureRaw && _extraProvider.HasValue && record.EventHeader.ProviderId == _extraProvider.Value)
             {
@@ -1479,6 +1516,7 @@ namespace AudioSwitcher
         private readonly AudioEndpoint _endpoint;
         private readonly bool _verbose;
         private readonly Dictionary<int, RunningGame> _running = new();
+        private readonly HashSet<int> _claimed = new();   // pids already taken (ETW-fast vs WMI dedup)
         private readonly object _lock = new();
         private readonly object _applyLock = new();   // serializes ApplyEffective (UI pause vs WMI events)
         private ProfileTier _lastApplied;
@@ -1562,6 +1600,7 @@ namespace AudioSwitcher
             // Start ETW
             try
             {
+                EtwMonitor.OnProcessStartFast = FastProcessStart;   // near-instant known-game launches
                 EtwMonitor.Start();
                 Log("ETW session active");
             }
@@ -1631,6 +1670,42 @@ namespace AudioSwitcher
             catch (Exception ex) { Log($"[warn] Idle restore failed: {ex.Message}"); }
         }
 
+        // Atomically reserve a pid so the ETW-fast path and the WMI watcher never both handle the
+        // same launch. Returns true if this caller claimed it first.
+        private bool Claim(int pid) { lock (_lock) { return _claimed.Add(pid); } }
+
+        // Near-instant launch handler, driven by the kernel ETW provider (~1ms after process create,
+        // vs WMI's ~1s). Only acts on games we ALREADY know (learned override / known-quirky): for
+        // those the safe format is resolved from the exe name alone, so we can drop it (freezing the
+        // game) BEFORE it opens its audio device. This is what lets the switch beat a game that inits
+        // audio the instant it starts (e.g. Hotline Miami). Unknown games are left to the WMI path.
+        private void FastProcessStart(int pid)
+        {
+            string exe;
+            DateTime? started = null;
+            try
+            {
+                using var p = Process.GetProcessById(pid);
+                exe = p.ProcessName + ".exe";
+                try { started = p.StartTime; } catch { }
+            }
+            catch { return; }   // already gone or unreadable - WMI still catches it if it's a game
+            if (string.IsNullOrEmpty(exe)) return;
+            if (_config.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase))) return;
+
+            var overrides = StateStore.LoadOverrides();
+            overrides.TryGetValue(exe, out var ov);
+            if (ov == null && !_config.KnownQuirky.ContainsKey(exe)) return;   // unknown -> let WMI handle it
+            if (!Claim(pid)) return;                                           // WMI already took this pid
+
+            // How long after the process actually started did we catch it? This is the number that
+            // decides whether the freeze beats the game's audio init - log it so it's verifiable.
+            if (started.HasValue)
+                Log($"ETW caught {exe} {(int)(DateTime.Now - started.Value).TotalMilliseconds}ms after launch");
+            RegisterAndApply(pid, exe, "", ov?.Engine ?? "", ov, overrides,
+                             ov != null ? "override/etw" : "known-quirky/etw", allowSuspend: true);
+        }
+
         private void OnProcessStart(object? sender, EventArrivedEventArgs e)
         {
             try
@@ -1651,8 +1726,11 @@ namespace AudioSwitcher
                 bool ignored = _config.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
                 if (!ignored && (ovEntry != null || _config.KnownQuirky.ContainsKey(exe)))
                 {
-                    RegisterAndApply(pid, exe, "", ovEntry?.Engine ?? "", ovEntry, overrides,
-                                     ovEntry != null ? "override" : "known-quirky", allowSuspend: true);
+                    // ETW's fast path usually claimed this already (and applied before the game hit
+                    // audio); only handle it here if it didn't.
+                    if (Claim(pid))
+                        RegisterAndApply(pid, exe, "", ovEntry?.Engine ?? "", ovEntry, overrides,
+                                         ovEntry != null ? "override" : "known-quirky", allowSuspend: true);
                     return;
                 }
 
@@ -1672,8 +1750,9 @@ namespace AudioSwitcher
                 // freezing across the 800ms fingerprint would stall the launch for no benefit.
                 Thread.Sleep(800);
                 string engine = GameDetection.Fingerprint(pid, path);
-                RegisterAndApply(pid, exe, path, engine, null, overrides, detection.Value.reason,
-                                 allowSuspend: false);
+                if (Claim(pid))
+                    RegisterAndApply(pid, exe, path, engine, null, overrides, detection.Value.reason,
+                                     allowSuspend: false);
             }
             catch (Exception ex)
             {
@@ -1751,7 +1830,7 @@ namespace AudioSwitcher
             {
                 int pid = Convert.ToInt32(e.NewEvent.Properties["ProcessID"].Value);
                 RunningGame? game = null;
-                lock (_lock) { _running.TryGetValue(pid, out game); _running.Remove(pid); }
+                lock (_lock) { _running.TryGetValue(pid, out game); _running.Remove(pid); _claimed.Remove(pid); }
                 if (game == null) return;
 
                 // Process exit code distinguishes a crash from a clean quit: a crash exits with

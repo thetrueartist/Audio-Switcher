@@ -75,8 +75,10 @@ all), a pause toggle, and an auto-start toggle.
 
 ## How it works
 
-1. **Detect.** WMI process-start events (sub-100 ms) flag a game by install path or
-   launcher parent, then fingerprint the engine (UE/Unity/Source/FMOD/Wwise…).
+1. **Detect.** A game we've *already* learned is caught the instant its process is created, via
+   the **ETW kernel process provider** — early enough to set the format (and freeze the game)
+   *before* it opens its audio device. First-time / unknown games are flagged by WMI process-start
+   events (install path or launcher parent), then fingerprinted for engine (UE/Unity/Source/FMOD/…).
 2. **Apply.** The device's shared-mode format is set via the private
    `IPolicyConfig::SetDeviceFormat` COM interface — the same path the Sound Control Panel
    uses (no registry hacks, no PnP bounce). If the device rejects a format, it walks down
