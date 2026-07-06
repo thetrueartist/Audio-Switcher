@@ -47,7 +47,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 7;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 8;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public bool CheckForUpdates { get; set; } = true;    // check GitHub Releases at startup (notify only)
         public int Channels { get; set; } = 2;
@@ -72,6 +72,15 @@ namespace AudioSwitcher
         // higher to find the true ceiling / self-heal over-drops. 0 = OFF (default) - a game
         // with a genuine limit will fail on the probe launch, so it's opt-in.
         public int ProbeEveryLaunches { get; set; } = 0;
+        // Freeze a known game across the format switch: the instant a game we've already learned (or
+        // that's known-quirky) launches, suspend all its threads, change the device format, then
+        // resume - so it physically cannot open its audio device at the old rate before the switch
+        // lands. Guarantees the switch wins the race (the game isn't running while we change it).
+        // OFF by default: suspending a process is the one thing an anti-cheat could object to, so
+        // enable it only for offline/single-player titles (e.g. Hotline Miami). Uses documented
+        // ntdll process suspend - no injection, no hooking. The fast-apply path is always on; this
+        // just adds the freeze for the cases where even a fast apply loses the race.
+        public bool SuspendDuringSwitch { get; set; } = false;
 
         public List<ProfileTier> ProfileTiers { get; set; } = new()
         {
@@ -1378,6 +1387,45 @@ namespace AudioSwitcher
         public bool Failed;             // a crash/glitch/silence bump fired this session
     }
 
+    // Optional game freeze across a format switch. Suspending every thread of the game the instant
+    // it launches, changing the device format, then resuming means the game opens its audio device
+    // at the NEW rate - it can't win the race because it isn't running while we switch. Uses the
+    // documented ntdll process-wide suspend (the same primitive Process Explorer / Process Hacker's
+    // "Suspend" uses); no memory read/write, no injection, no hooking. Off by default (SuspendDuring-
+    // Switch) because a running anti-cheat could flag the handle/suspend; meant for offline titles.
+    static class ProcessControl
+    {
+        [DllImport("ntdll.dll")] static extern int NtSuspendProcess(IntPtr handle);
+        [DllImport("ntdll.dll")] static extern int NtResumeProcess(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(int access, bool inheritHandle, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr handle);
+        const int PROCESS_SUSPEND_RESUME = 0x0800;
+
+        // Freeze the process; returns a handle to pass to Resume, or IntPtr.Zero on any failure
+        // (caller then just proceeds unfrozen - freezing is best-effort, it never blocks a launch).
+        public static IntPtr Suspend(int pid)
+        {
+            try
+            {
+                IntPtr h = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+                if (h == IntPtr.Zero) return IntPtr.Zero;
+                if (NtSuspendProcess(h) != 0) { CloseHandle(h); return IntPtr.Zero; }
+                return h;
+            }
+            catch { return IntPtr.Zero; }
+        }
+
+        // Resume and release the handle. Safe to call with IntPtr.Zero (no-op).
+        public static void Resume(IntPtr handle)
+        {
+            if (handle == IntPtr.Zero) return;
+            try { NtResumeProcess(handle); } catch { }
+            try { CloseHandle(handle); } catch { }
+        }
+    }
+
     public class Daemon
     {
         private readonly Config _config;
@@ -1544,6 +1592,23 @@ namespace AudioSwitcher
                 int ppid = Convert.ToInt32(e.NewEvent.Properties["ParentProcessID"].Value);
                 string exe = e.NewEvent.Properties["ProcessName"].Value?.ToString() ?? "";
 
+                // Fastest path: a game we've already learned (override) or that's known-quirky is
+                // fully resolved from its exe name alone - no path read, no engine fingerprint. Apply
+                // its safe format the INSTANT the PID appears, before the game opens its audio device.
+                // This is the case that matters for "switch too slow": a repeat launch of a game we
+                // already KNOW needs a lower rate. Skipping the ~250ms path probe and ~800ms
+                // fingerprint below cuts ~1s of latency, and with SuspendDuringSwitch the game is
+                // frozen across the switch so it cannot lose the race at all.
+                var overrides = StateStore.LoadOverrides();
+                overrides.TryGetValue(exe, out var ovEntry);   // null if none learned
+                bool ignored = _config.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+                if (!ignored && (ovEntry != null || _config.KnownQuirky.ContainsKey(exe)))
+                {
+                    RegisterAndApply(pid, exe, "", ovEntry?.Engine ?? "", ovEntry, overrides,
+                                     ovEntry != null ? "override" : "known-quirky", allowSuspend: true);
+                    return;
+                }
+
                 Thread.Sleep(250);
                 string path = "";
                 // UWP/Store games (e.g. Minecraft Bedrock) run in an AppContainer - MainModule is
@@ -1555,61 +1620,70 @@ namespace AudioSwitcher
                 var detection = GameDetection.IsGame(path, exe, ppid, _config);
                 if (detection == null) return;
 
-                // Fast path: if we already know this game (learned override or known-quirky), use
-                // its profile immediately instead of waiting ~800ms to fingerprint the engine -
-                // set the safe rate before the game inits audio, not after.
-                var overrides = StateStore.LoadOverrides();
-                overrides.TryGetValue(exe, out var ovEntry);   // null if none learned
-                bool isKnown = ovEntry != null || _config.KnownQuirky.ContainsKey(exe);
-                string engine;
-                if (isKnown)
-                {
-                    engine = ovEntry?.Engine ?? "";
-                }
-                else
-                {
-                    Thread.Sleep(800);
-                    engine = GameDetection.Fingerprint(pid, path);
-                }
-                var profile = ResolveProfile(exe, engine);
-                int tier = profile.tier, rate = profile.rate, bits = profile.bits;
-                string source = profile.source;
-                bool isProbe = false;
-
-                // Upward probe: every Nth launch of an overridden game, retry one tier HIGHER to
-                // discover the true ceiling / self-heal an over-drop. If it fails, normal learning
-                // re-drops it; if it survives a clean session, OnProcessStop promotes it.
-                if (ovEntry != null && _config.ProbeEveryLaunches > 0 && ovEntry.TierIdx > 0)
-                {
-                    if (++ovEntry.Launches >= _config.ProbeEveryLaunches)
-                    {
-                        ovEntry.Launches = 0;
-                        tier = ovEntry.TierIdx - 1;
-                        var pt = _config.ProfileTiers[tier];
-                        rate = pt.Rate; bits = pt.Bits; source = $"probe up from tier {ovEntry.TierIdx}";
-                        isProbe = true;
-                    }
-                    StateStore.SaveOverrides(overrides);   // persist launch counter / reset
-                }
-
-                lock (_lock)
-                {
-                    _running[pid] = new RunningGame
-                    {
-                        Pid = pid, Exe = exe, Engine = engine, ExePath = path,
-                        StartedAt = DateTime.Now,
-                        Profile = new ProfileTier { Rate = rate, Bits = bits, Name = "" },
-                        TierIdx = tier,
-                        IsProbe = isProbe
-                    };
-                }
-                Log($"+ {exe}  [{detection.Value.reason} | {engine} | tier {tier} {source}]");
-                ApplyEffective();
+                // Never-seen game: fingerprint the engine so a first-timer starts at its engine's
+                // default tier (e.g. UE one down). No suspend here - we don't yet know the rate, and
+                // freezing across the 800ms fingerprint would stall the launch for no benefit.
+                Thread.Sleep(800);
+                string engine = GameDetection.Fingerprint(pid, path);
+                RegisterAndApply(pid, exe, path, engine, null, overrides, detection.Value.reason,
+                                 allowSuspend: false);
             }
             catch (Exception ex)
             {
                 if (_verbose) Log($"[warn] start handler: {ex.Message}");
             }
+        }
+
+        // Resolve the profile, register the running game, and apply the format - shared by the fast
+        // (known-game) and slow (first-seen) launch paths. When allowSuspend is set and the user has
+        // opted into SuspendDuringSwitch, the game is frozen across the format change so it cannot
+        // open its audio device at the old rate first (the definitive fix for switch-too-slow).
+        private void RegisterAndApply(int pid, string exe, string path, string engine,
+                                      OverrideEntry? ovEntry, Dictionary<string, OverrideEntry> overrides,
+                                      string reason, bool allowSuspend)
+        {
+            var profile = ResolveProfile(exe, engine);
+            int tier = profile.tier, rate = profile.rate, bits = profile.bits;
+            string source = profile.source;
+            bool isProbe = false;
+
+            // Upward probe: every Nth launch of an overridden game, retry one tier HIGHER to
+            // discover the true ceiling / self-heal an over-drop. If it fails, normal learning
+            // re-drops it; if it survives a clean session, OnProcessStop promotes it.
+            if (ovEntry != null && _config.ProbeEveryLaunches > 0 && ovEntry.TierIdx > 0)
+            {
+                if (++ovEntry.Launches >= _config.ProbeEveryLaunches)
+                {
+                    ovEntry.Launches = 0;
+                    tier = ovEntry.TierIdx - 1;
+                    var pt = _config.ProfileTiers[tier];
+                    rate = pt.Rate; bits = pt.Bits; source = $"probe up from tier {ovEntry.TierIdx}";
+                    isProbe = true;
+                }
+                StateStore.SaveOverrides(overrides);   // persist launch counter / reset
+            }
+
+            lock (_lock)
+            {
+                _running[pid] = new RunningGame
+                {
+                    Pid = pid, Exe = exe, Engine = engine, ExePath = path,
+                    StartedAt = DateTime.Now,
+                    Profile = new ProfileTier { Rate = rate, Bits = bits, Name = "" },
+                    TierIdx = tier,
+                    IsProbe = isProbe
+                };
+            }
+            Log($"+ {exe}  [{reason} | {engine} | tier {tier} {source}]");
+
+            // Optionally freeze the game across the switch so it physically cannot open audio at the
+            // old rate before the new format is live. Opt-in (anti-cheat-unsafe); known games only,
+            // since we resolve their rate instantly. Suspend is best-effort - if it fails we still
+            // apply. ApplyEffective is synchronous, so the freeze lasts only the ~tens-of-ms switch.
+            IntPtr frozen = (allowSuspend && _config.SuspendDuringSwitch) ? ProcessControl.Suspend(pid) : IntPtr.Zero;
+            if (frozen != IntPtr.Zero) Log($"  froze {exe} across switch");
+            try { ApplyEffective(); }
+            finally { ProcessControl.Resume(frozen); }
         }
 
         private void OnProcessStop(object? sender, EventArrivedEventArgs e)

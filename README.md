@@ -40,7 +40,8 @@ game, exactly when a game needs it — automatically.
   re-tests whether a game can go higher, to find the true ceiling.
 - **System-tray app + GUI control panel** — live status, running games, per-game
   profiles, pause, and auto-start toggle.
-- **Anti-cheat safe.** Never reads, writes, suspends, or injects into game processes.
+- **Anti-cheat safe by default.** Never reads, writes, or injects into game processes. (One
+  *opt-in, off-by-default* feature briefly suspends a game to nail the switch — for offline titles.)
 - **No third-party dependencies.** Pure Windows API (P/Invoke + COM). Releases are a
   self-contained exe — no .NET install required.
 
@@ -78,7 +79,9 @@ all), a pause toggle, and an auto-start toggle.
 2. **Apply.** The device's shared-mode format is set via the private
    `IPolicyConfig::SetDeviceFormat` COM interface — the same path the Sound Control Panel
    uses (no registry hacks, no PnP bounce). If the device rejects a format, it walks down
-   to the next one it accepts.
+   to the next one it accepts. For a game we've **already learned**, the format is applied the
+   instant its process appears — skipping the path/fingerprint step (~1 s) so the switch lands
+   *before* the game opens its audio device, not after.
 3. **Learn.** A game's tier is bumped down and remembered on any of:
    - **crash** — process exits non-zero within ~25 s (a clean exit is never a crash);
    - **glitch storm** — Warning+ events from `Microsoft-Windows-Audio`;
@@ -130,6 +133,12 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
   peak meter reads sound before ever acting (a broken meter can't misfire). 0 = off.
   `SilenceGraceSeconds` ignores the first N seconds (loading).
 - `ProbeEveryLaunches` — **0 = off**; set e.g. `5` to enable the upward probe.
+- `SuspendDuringSwitch` — **off by default.** For a *known* game (already learned or known-quirky),
+  freeze it the instant it launches, change the format, then resume — so it can't open its audio
+  device at the old rate before the switch lands. Guarantees the switch wins the race even for games
+  that init audio the moment they start. Set `true` **only for offline/single-player games**: it
+  suspends the process (documented ntdll suspend, no injection), which a running anti-cheat could
+  flag. The always-on fast-apply already handles most games; this is for the stubborn ones.
 
 Config is validated on load (bad values can't crash it) and regenerated if it's from an
 older version (the old one is kept as `config.json.old`). State files
@@ -164,9 +173,15 @@ release tag.
 
 ## Anti-cheat
 
-The daemon never reads, writes, suspends, or injects into game processes. Format changes
-go through the Windows audio service; detection is WMI/ETW observation. EAC/BattlEye/VAC
+By default the daemon never reads, writes, suspends, or injects into game processes. Format
+changes go through the Windows audio service; detection is WMI/ETW observation. EAC/BattlEye/VAC
 have nothing to react to.
+
+The **one** exception is opt-in and off by default: `SuspendDuringSwitch` briefly suspends a
+*known* game across the format switch (documented ntdll process suspend — still no memory access,
+no injection, no hooking) so it can't open audio at the wrong rate first. Suspending a process is
+the one thing an anti-cheat could object to, so leave it off for online games; enable it only for
+offline/single-player titles. The default path stays fully hands-off.
 
 ## FAQ
 
