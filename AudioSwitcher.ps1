@@ -191,6 +191,18 @@ function Install-Task {
     # Clear the "gui shown" marker so the control panel pops up once after (re)install.
     Remove-Item (Join-Path $env:LOCALAPPDATA "AudioSwitcher\.gui-shown") -Force -ErrorAction SilentlyContinue
 
+    # Start Menu shortcut so it's searchable (Win+S "AudioSwitcher"). Opening it shows the control panel.
+    try {
+        $lnkPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AudioSwitcher.lnk"
+        $ws = New-Object -ComObject WScript.Shell
+        $lnk = $ws.CreateShortcut($lnkPath)
+        $lnk.TargetPath = $Exe
+        $lnk.WorkingDirectory = $InstallDir
+        $lnk.Description = "AudioSwitcher - per-game audio format switcher"
+        $lnk.Save()
+        Write-Host "  Start Menu shortcut created (search 'AudioSwitcher')." -ForegroundColor DarkGray
+    } catch { }
+
     Write-Host "Starting daemon now..." -ForegroundColor Cyan
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 2
@@ -212,6 +224,7 @@ function Uninstall-Task {
         Write-Host "Deleting $Exe..." -ForegroundColor Yellow
         Remove-Item $Exe -Force
     }
+    Remove-Item (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AudioSwitcher.lnk") -Force -ErrorAction SilentlyContinue
     Write-Host "Done. State files in $env:LOCALAPPDATA\AudioSwitcher\ are preserved." -ForegroundColor Green
     Write-Host "Delete that folder manually if you want a clean slate." -ForegroundColor DarkGray
 }

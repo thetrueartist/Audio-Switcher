@@ -1280,6 +1280,10 @@ namespace AudioSwitcher
                     return "swap failed (rolled back): " + ex.Message;
                 }
 
+                // Clear the first-run marker so the restarted daemon opens the control panel
+                // (the user sees it came back on the new version).
+                try { File.Delete(Path.Combine(StateStore.ConfigDir, ".gui-shown")); } catch { }
+
                 // Helper: wait for THIS process to exit, then start the new exe and remove .old.
                 int pid = Process.GetCurrentProcess().Id;
                 string helper = Path.Combine(Path.GetTempPath(), "AudioSwitcherUpdate", "restart.cmd");
@@ -1377,6 +1381,14 @@ namespace AudioSwitcher
         public int CurrentRate => _lastApplied.Rate;
         public bool AtIdle { get { lock (_lock) return _running.Count == 0; } }
         public string UpdateVersion { get; private set; } = "";   // set if a newer release exists ("" = up to date/unknown)
+        public volatile bool ShowGuiRequested;   // set by IPC "showgui" when the exe is opened again
+        public bool UpdateChecked;                // true once a check has completed (for the GUI)
+        public string CheckForUpdatesNow()
+        {
+            try { UpdateVersion = UpdateChecker.NewerVersion(Program.AppVersion()); } catch { }
+            UpdateChecked = true;
+            return UpdateVersion;
+        }
         // True when the currently-applied format equals the idle/audiophile tier - i.e. NOT lowered.
         public bool CurrentIsIdleFormat
         {
@@ -1466,12 +1478,8 @@ namespace AudioSwitcher
             if (_config.CheckForUpdates)
                 ThreadPool.QueueUserWorkItem(_ =>
                 {
-                    try
-                    {
-                        string v = UpdateChecker.NewerVersion(Program.AppVersion());
-                        if (!string.IsNullOrEmpty(v)) { UpdateVersion = v; Log($"Update available: v{v} (you have v{Program.AppVersion()})"); }
-                    }
-                    catch { }
+                    string v = CheckForUpdatesNow();
+                    if (!string.IsNullOrEmpty(v)) Log($"Update available: v{v} (you have v{Program.AppVersion()})");
                 });
 
             Log("Active. Ctrl-C to exit.");
@@ -1915,7 +1923,11 @@ namespace AudioSwitcher
                     using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
                     using var writer = new StreamWriter(server, Encoding.UTF8) { AutoFlush = true };
                     string? cmd = reader.ReadLine();
-                    if (cmd == "status")
+                    if (cmd == "showgui")
+                    {
+                        ShowGuiRequested = true;   // the tray timer picks this up and opens the window
+                    }
+                    else if (cmd == "status")
                     {
                         lock (_lock)
                         {
@@ -2100,6 +2112,9 @@ namespace AudioSwitcher
             bool updateNotified = false;
             timer.Tick += (_, __) =>
             {
+                // Someone re-opened the exe (or clicked the Start Menu shortcut) -> show the window.
+                if (daemon.ShowGuiRequested) { daemon.ShowGuiRequested = false; OpenWindow(); }
+
                 // Green = at full/idle quality (even if a game is running), amber = actually lowered, grey = paused.
                 Color c = daemon.Paused ? Grey : (daemon.CurrentIsIdleFormat ? Green : Amber);
                 string state = daemon.Paused ? "paused"
@@ -2247,12 +2262,26 @@ namespace AudioSwitcher
             });
         }
 
+        // On-demand "check for updates" (the link when no update is known).
+        public void CheckNow()
+        {
+            if (_checking) return;
+            _checking = true;
+            Refresh2();
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                _d.CheckForUpdatesNow();
+                try { BeginInvoke(new Action(() => { _checking = false; Refresh2(); })); } catch { }
+            });
+        }
+
         private readonly Daemon _d;
         private readonly Label _lblDevice = Lbl(), _lblFormat = Lbl(), _lblState = Lbl();
         private readonly ListBox _games = new() { IntegralHeight = false };
         private readonly ListBox _overrides = new() { IntegralHeight = false };
         private readonly Button _btnPause = new();
-        private readonly LinkLabel _lblUpdate = new() { AutoSize = true, Visible = false, LinkColor = Color.FromArgb(30, 120, 40) };
+        private readonly LinkLabel _lblUpdate = new() { AutoSize = true, LinkColor = Color.FromArgb(30, 120, 40) };
+        private bool _checking;
         private readonly CheckBox _chkAuto = new() { Text = "Start automatically at logon", AutoSize = true };
         private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
         private bool _syncingAuto;
@@ -2263,8 +2292,8 @@ namespace AudioSwitcher
         {
             _d = d;
             Text = "AudioSwitcher v" + Program.AppVersion();
-            ClientSize = new Size(460, 560);
-            MinimumSize = new Size(420, 480);
+            ClientSize = new Size(460, 580);
+            MinimumSize = new Size(420, 500);
             StartPosition = FormStartPosition.CenterScreen;
             Font = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
             try { Icon = IconFactory.Make(Color.FromArgb(46, 160, 67)); } catch { }
@@ -2284,10 +2313,10 @@ namespace AudioSwitcher
             var by = new Label { Text = "v" + Program.AppVersion() + "    by @thetrueartist", AutoSize = true, ForeColor = Color.Gray,
                 Location = new Point(x + 2, y + 30) };
             Controls.Add(by);
-            _lblUpdate.Location = new Point(x + 2, y + 48);
-            _lblUpdate.Click += (_, __) => DoInstall();
+            _lblUpdate.Location = new Point(x + 2, y + 52);
+            _lblUpdate.Click += (_, __) => { if (!string.IsNullOrEmpty(_d.UpdateVersion)) DoInstall(); else CheckNow(); };
             Controls.Add(_lblUpdate);
-            y += 58;
+            y += 80;
 
             _lblDevice.Location = new Point(x, y); Controls.Add(_lblDevice); y += 24;
             _lblFormat.Location = new Point(x, y); _lblFormat.Font = new Font(Font, FontStyle.Bold);
@@ -2346,12 +2375,14 @@ namespace AudioSwitcher
             _lblState.ForeColor = stateColor;
             _btnPause.Text = _d.Paused ? "Resume switching" : "Pause switching";
 
-            if (!string.IsNullOrEmpty(_d.UpdateVersion))
-            {
+            if (_checking)
+                _lblUpdate.Text = "Checking for updates...";
+            else if (!string.IsNullOrEmpty(_d.UpdateVersion))
                 _lblUpdate.Text = $"Update available: v{_d.UpdateVersion} - click to install";
-                _lblUpdate.Visible = true;
-            }
-            else _lblUpdate.Visible = false;
+            else if (_d.UpdateChecked)
+                _lblUpdate.Text = "You're up to date - click to check again";
+            else
+                _lblUpdate.Text = "Check for updates";
 
             var g = _d.RunningGameNames();
             SyncList(_games, g.Count == 0 ? new List<string> { "(none)" } : g);
@@ -2496,11 +2527,10 @@ namespace AudioSwitcher
                 // pipe and the format writes. If one is already running, don't start another.
                 if (AnotherInstanceRunning())
                 {
-                    string msg = "AudioSwitcher is already running (check the system tray).";
                     if (args.Contains("--console") || args.Contains("--foreground"))
-                        Console.Error.WriteLine(msg + " Stop it first (tray -> Quit, or menu -> Stop).");
+                        Console.Error.WriteLine("AudioSwitcher is already running. Stop it first (tray -> Quit).");
                     else
-                        try { MessageBox.Show(msg, "AudioSwitcher", MessageBoxButtons.OK, MessageBoxIcon.Information); } catch { }
+                        SendPipe("showgui");   // re-opening the exe -> tell the running daemon to open its window
                     return 0;
                 }
 
@@ -2714,6 +2744,19 @@ namespace AudioSwitcher
             StateStore.SaveOverrides(ov);
             Console.WriteLine($"Locked {exe} -> tier {tier} ({t.Rate}/{t.Bits})");
             return 0;
+        }
+
+        // Fire-and-forget a one-word command to the running daemon (e.g. "showgui").
+        private static void SendPipe(string cmd)
+        {
+            try
+            {
+                using var client = new NamedPipeClientStream(".", "AudioSwitcherPipe", PipeDirection.InOut);
+                client.Connect(2000);
+                using var writer = new StreamWriter(client, Encoding.UTF8) { AutoFlush = true };
+                writer.WriteLine(cmd);
+            }
+            catch { }
         }
 
         private static int QueryStatus()
