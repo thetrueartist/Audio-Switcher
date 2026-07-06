@@ -1116,10 +1116,11 @@ namespace AudioSwitcher
             {
                 Console.ForegroundColor = ConsoleColor.Cyan;
                 Console.WriteLine();
-                Console.WriteLine(@"    _             _ _       ____          _ _       _");
-                Console.WriteLine(@"   /_\ _  _ __| (_)___  / ___|_ __ _(_) |_ __| |_  ___ _ _");
-                Console.WriteLine(@"  / _ \ || / _` | / _ \ \___ \ V  V / |  _/ _| ' \/ -_) '_|");
-                Console.WriteLine(@" /_/ \_\_,_\__,_|_\___/ |____/\_/\_/|_|\__\__|_||_\___|_|");
+                Console.WriteLine("   ##  #  # ###  ###  ##   ### #   # ### ###  ### #  # #### ###");
+                Console.WriteLine("  #  # #  # #  #  #  #  # #    #   #  #   #  #    #  # #    #  #");
+                Console.WriteLine("  #### #  # #  #  #  #  #  ##  # # #  #   #  #    #### ###  ###");
+                Console.WriteLine("  #  # #  # #  #  #  #  #    # ## ##  #   #  #    #  # #    # #");
+                Console.WriteLine("  #  #  ##  ###  ###  ##  ###  #   # ###  #   ### #  # #### #  #");
                 Console.ForegroundColor = ConsoleColor.DarkGray;
                 Console.WriteLine("  per-game audio format switcher            by @thetrueartist");
                 Console.ResetColor();
