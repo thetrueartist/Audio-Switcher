@@ -1,0 +1,19 @@
+# Internal handoff notes (personal context) - not for the public repo
+CLAUDE.md
+
+# Build output
+bin/
+obj/
+*.user
+*.suo
+
+# Published binary / temp build dir used by AudioSwitcher.ps1
+publish/
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Runtime state lives in %LOCALAPPDATA%\AudioSwitcher\, never in the repo:
+#   config.json, overrides.json, crash-log.json, glitch-log.json
