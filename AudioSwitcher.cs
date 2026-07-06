@@ -1690,6 +1690,7 @@ namespace AudioSwitcher
 
             var menu = new ContextMenuStrip();
             var hdr = new ToolStripMenuItem("AudioSwitcher") { Enabled = false };
+            var open = new ToolStripMenuItem("Open control panel...") { Font = new Font(SystemFonts.MenuFont ?? SystemFonts.DefaultFont, FontStyle.Bold) };
             var status = new ToolStripMenuItem("starting...") { Enabled = false };
             var games = new ToolStripMenuItem("No games running") { Enabled = false };
             var pause = new ToolStripMenuItem("Pause switching");
@@ -1704,6 +1705,9 @@ namespace AudioSwitcher
                 ContextMenuStrip = menu
             };
 
+            void OpenWindow() => MainWindow.ShowSingleton(daemon);
+            open.Click += (_, __) => OpenWindow();
+            tray.DoubleClick += (_, __) => OpenWindow();
             pause.Click += (_, __) => { daemon.SetPaused(!daemon.Paused); };
             logs.Click += (_, __) =>
             {
@@ -1718,7 +1722,7 @@ namespace AudioSwitcher
 
             menu.Items.AddRange(new ToolStripItem[]
             {
-                hdr, new ToolStripSeparator(), status, games,
+                hdr, new ToolStripSeparator(), open, status, games,
                 new ToolStripSeparator(), pause, logs,
                 new ToolStripSeparator(), quit
             });
@@ -1756,6 +1760,203 @@ namespace AudioSwitcher
 
             Application.Run();   // pumps messages until Application.Exit()
             tray.Dispose();
+        }
+    }
+
+    // Auto-start via the logon scheduled task, managed from the GUI (the daemon runs
+    // elevated, so it can create/remove the task). Mirrors what AudioSwitcher.ps1 -Install does.
+    public static class AutoStart
+    {
+        private const string TaskName = "AudioSwitcherDaemon";
+
+        public static bool IsEnabled() => Run($"/query /tn \"{TaskName}\"") == 0;
+
+        public static void Enable()
+        {
+            string exe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+            if (exe.Length == 0) return;
+            Run($"/create /tn \"{TaskName}\" /tr \"\\\"{exe}\\\"\" /sc onlogon /rl highest /f");
+        }
+
+        public static void Disable() => Run($"/delete /tn \"{TaskName}\" /f");
+
+        private static int Run(string args)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo("schtasks.exe", args)
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                using var p = Process.Start(psi);
+                if (p == null) return -1;
+                p.WaitForExit(8000);
+                return p.ExitCode;
+            }
+            catch { return -1; }
+        }
+    }
+
+    // ====================================================================
+    // GUI CONTROL PANEL (WinForms) - the "real window" beyond the tray menu
+    // ====================================================================
+    public class MainWindow : Form
+    {
+        private static MainWindow? _instance;
+        public static void ShowSingleton(Daemon d)
+        {
+            if (_instance == null || _instance.IsDisposed)
+            {
+                _instance = new MainWindow(d);
+                _instance.Show();
+            }
+            if (_instance.WindowState == FormWindowState.Minimized) _instance.WindowState = FormWindowState.Normal;
+            _instance.Activate();
+            _instance.BringToFront();
+        }
+
+        private readonly Daemon _d;
+        private readonly Label _lblDevice = Lbl(), _lblFormat = Lbl(), _lblState = Lbl();
+        private readonly ListBox _games = new() { IntegralHeight = false };
+        private readonly ListBox _overrides = new() { IntegralHeight = false };
+        private readonly Button _btnPause = new();
+        private readonly CheckBox _chkAuto = new() { Text = "Start automatically at logon", AutoSize = true };
+        private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
+        private bool _syncingAuto;
+
+        private static Label Lbl() => new() { AutoSize = true };
+
+        public MainWindow(Daemon d)
+        {
+            _d = d;
+            Text = "AudioSwitcher";
+            ClientSize = new Size(460, 560);
+            MinimumSize = new Size(420, 480);
+            StartPosition = FormStartPosition.CenterScreen;
+            Font = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
+            try { Icon = IconFactory.Make(Color.FromArgb(46, 160, 67)); } catch { }
+            BuildUi();
+            _timer.Tick += (_, __) => Refresh2();
+            _timer.Start();
+            Refresh2();
+        }
+
+        private void BuildUi()
+        {
+            int x = 16, y = 14, w = ClientSize.Width - 32;
+
+            var title = new Label { Text = "AudioSwitcher", AutoSize = true, Location = new Point(x, y),
+                Font = new Font(Font.FontFamily, 15, FontStyle.Bold), ForeColor = Color.FromArgb(46, 130, 200) };
+            Controls.Add(title);
+            var by = new Label { Text = "by @thetrueartist", AutoSize = true, ForeColor = Color.Gray,
+                Location = new Point(x + 2, y + 30) };
+            Controls.Add(by);
+            y += 58;
+
+            _lblDevice.Location = new Point(x, y); Controls.Add(_lblDevice); y += 24;
+            _lblFormat.Location = new Point(x, y); _lblFormat.Font = new Font(Font, FontStyle.Bold);
+            Controls.Add(_lblFormat); y += 24;
+            _lblState.Location = new Point(x, y); Controls.Add(_lblState); y += 32;
+
+            _btnPause.SetBounds(x, y, 150, 30);
+            _btnPause.Click += (_, __) => { _d.SetPaused(!_d.Paused); Refresh2(); };
+            Controls.Add(_btnPause);
+
+            _chkAuto.Location = new Point(x + 165, y + 6);
+            _chkAuto.CheckedChanged += (_, __) =>
+            {
+                if (_syncingAuto) return;
+                if (_chkAuto.Checked) AutoStart.Enable(); else AutoStart.Disable();
+                Refresh2();
+            };
+            Controls.Add(_chkAuto);
+            y += 42;
+
+            Controls.Add(new Label { Text = "Running games", AutoSize = true, Location = new Point(x, y),
+                ForeColor = Color.Gray }); y += 20;
+            _games.SetBounds(x, y, w, 80); Controls.Add(_games); y += 90;
+
+            Controls.Add(new Label { Text = "Learned per-game profiles", AutoSize = true, Location = new Point(x, y),
+                ForeColor = Color.Gray }); y += 20;
+            _overrides.SetBounds(x, y, w, 150); Controls.Add(_overrides); y += 158;
+
+            var btnClear = new Button { Text = "Clear selected", Location = new Point(x, y) };
+            btnClear.Width = 130; btnClear.Height = 30;
+            btnClear.Click += (_, __) => ClearSelected();
+            Controls.Add(btnClear);
+
+            var btnReset = new Button { Text = "Reset all learning", Location = new Point(x + 140, y) };
+            btnReset.Width = 150; btnReset.Height = 30;
+            btnReset.Click += (_, __) => ResetLearning();
+            Controls.Add(btnReset);
+
+            var btnLogs = new Button { Text = "Open logs", Location = new Point(x + 300, y) };
+            btnLogs.Width = 100; btnLogs.Height = 30;
+            btnLogs.Click += (_, __) => { try { Process.Start(new ProcessStartInfo { FileName = StateStore.ConfigDir, UseShellExecute = true }); } catch { } };
+            Controls.Add(btnLogs);
+        }
+
+        private void Refresh2()
+        {
+            _lblDevice.Text = "Device:  " + _d.DeviceName;
+            _lblFormat.Text = "Now:  " + _d.CurrentFormat;
+            string state = _d.Paused ? "Paused (holding idle)" : (_d.AtIdle ? "Idle - audiophile profile" : "Game running - format lowered");
+            _lblState.Text = "State:  " + state;
+            _btnPause.Text = _d.Paused ? "Resume switching" : "Pause switching";
+
+            var g = _d.RunningGameNames();
+            SyncList(_games, g.Count == 0 ? new List<string> { "(none)" } : g);
+
+            var ov = StateStore.LoadOverrides();
+            var lines = ov.Count == 0 ? new List<string> { "(nothing learned yet)" }
+                : ov.Select(kv => $"{kv.Key}  ->  tier {kv.Value.TierIdx}  {kv.Value.Rate}/{kv.Value.Bits}"
+                    + (kv.Value.Locked ? "  [locked]" : "")).ToList();
+            SyncList(_overrides, lines);
+
+            _syncingAuto = true;
+            try { _chkAuto.Checked = AutoStart.IsEnabled(); } catch { }
+            _syncingAuto = false;
+        }
+
+        private static void SyncList(ListBox box, List<string> items)
+        {
+            // Only rebuild if changed, to preserve selection and avoid flicker.
+            if (box.Items.Count == items.Count)
+            {
+                bool same = true;
+                for (int i = 0; i < items.Count; i++)
+                    if (!Equals(box.Items[i], items[i])) { same = false; break; }
+                if (same) return;
+            }
+            int sel = box.SelectedIndex;
+            box.BeginUpdate();
+            box.Items.Clear();
+            foreach (var s in items) box.Items.Add(s);
+            if (sel >= 0 && sel < box.Items.Count) box.SelectedIndex = sel;
+            box.EndUpdate();
+        }
+
+        private void ClearSelected()
+        {
+            if (_overrides.SelectedItem is not string line) return;
+            int arrow = line.IndexOf("  ->", StringComparison.Ordinal);
+            if (arrow <= 0) return;
+            string exe = line.Substring(0, arrow);
+            var ov = StateStore.LoadOverrides();
+            if (ov.Remove(exe)) { StateStore.SaveOverrides(ov); Refresh2(); }
+        }
+
+        private void ResetLearning()
+        {
+            if (MessageBox.Show(this, "Forget all learned per-game profiles and crash/glitch history?",
+                "Reset learning", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            foreach (var f in new[] { StateStore.OverridesFile, StateStore.CrashLogFile, StateStore.GlitchLogFile })
+                try { if (File.Exists(f)) File.Delete(f); } catch { }
+            Refresh2();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            _timer.Stop();
+            base.OnFormClosing(e);   // just closes the window; the daemon keeps running in the tray
         }
     }
 

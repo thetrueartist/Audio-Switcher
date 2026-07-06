@@ -81,6 +81,10 @@ Once installed it runs at every logon and lives in your **system tray** (a small
 speaker icon: green = full quality, amber = lowered for a game, grey = paused).
 Right-click it for status, pause/resume, logs, or quit.
 
+**Double-click the tray icon** (or "Open control panel...") for the full **GUI window**:
+live device/format/state, running games, learned per-game profiles (clear one or
+reset all), a pause toggle, and an auto-start toggle.
+
 Prefer PowerShell? Same thing:
 
 ```powershell
