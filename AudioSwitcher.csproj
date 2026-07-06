@@ -1,6 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <!-- WinExe = no console window at startup (it's a tray app). CLI output still works:
+         PowerShell captures stdout via a pipe regardless of subsystem, and we AttachConsole
+         to the parent terminal for direct runs. -->
+    <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <RootNamespace>AudioSwitcher</RootNamespace>
     <AssemblyName>AudioSwitcher</AssemblyName>

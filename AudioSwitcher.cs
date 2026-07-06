@@ -1097,6 +1097,7 @@ namespace AudioSwitcher
         private readonly bool _verbose;
         private readonly Dictionary<int, RunningGame> _running = new();
         private readonly object _lock = new();
+        private readonly object _applyLock = new();   // serializes ApplyEffective (UI pause vs WMI events)
         private ProfileTier _lastApplied;
         private ManagementEventWatcher? _startWatcher;
         private ManagementEventWatcher? _stopWatcher;
@@ -1132,7 +1133,9 @@ namespace AudioSwitcher
         {
             Paused = p;
             Log(p ? "Paused - holding idle profile, ignoring games" : "Resumed");
-            ApplyEffective();
+            // Apply OFF the caller's thread: this is invoked from the GUI/tray UI thread, and the
+            // format change is a blocking COM call that would otherwise freeze the window.
+            ThreadPool.QueueUserWorkItem(_ => { try { ApplyEffective(); } catch { } });
         }
 
         public void Run()
@@ -1514,25 +1517,30 @@ namespace AudioSwitcher
 
         private void ApplyEffective()
         {
-            ProfileTier target;
-            lock (_lock)
+            // Serialized: the UI pause toggle, the WMI start/stop handlers and the glitch pump all
+            // call this. Without this lock, two concurrent applies can leave the device format and
+            // _lastApplied out of sync, so later switches get wrongly skipped ("stops switching").
+            lock (_applyLock)
             {
-                if (Paused || _running.Count == 0)   // paused -> hold the idle/max profile
-                    target = _config.ProfileTiers[_config.IdleTier];
-                else
+                ProfileTier target;
+                bool anyRunning;
+                lock (_lock)
                 {
-                    target = _running.Values
-                        .Select(g => g.Profile)
-                        .OrderBy(p => p.Rate).ThenBy(p => p.Bits)
-                        .First();
+                    anyRunning = _running.Count > 0;
+                    if (Paused || !anyRunning)   // paused -> hold the idle/max profile
+                        target = _config.ProfileTiers[_config.IdleTier];
+                    else
+                        target = _running.Values
+                            .Select(g => g.Profile)
+                            .OrderBy(p => p.Rate).ThenBy(p => p.Bits)
+                            .First();
                 }
-            }
-            if (target.Rate != _lastApplied.Rate || target.Bits != _lastApplied.Bits)
-            {
-                string reason;
-                lock (_lock) { reason = _running.Count == 0 ? "idle restore" : "game running"; }
-                Log($"=> {target.Rate}Hz / {target.Bits}-bit  [{reason}]");
-                ApplySupported(target);
+                if (target.Rate != _lastApplied.Rate || target.Bits != _lastApplied.Bits)
+                {
+                    string reason = Paused ? "paused" : (anyRunning ? "game running" : "idle restore");
+                    Log($"=> {target.Rate}Hz / {target.Bits}-bit  [{reason}]");
+                    ApplySupported(target);
+                }
             }
         }
 
@@ -2000,9 +2008,15 @@ namespace AudioSwitcher
     // ====================================================================
     public static class Program
     {
+        [DllImport("kernel32.dll")] private static extern bool AttachConsole(int dwProcessId);
+        private const int ATTACH_PARENT_PROCESS = -1;
+
         [STAThread]
         public static int Main(string[] args)
         {
+            // WinExe has no console. If launched from a terminal directly, attach to it so CLI
+            // output is visible. (PowerShell's `& $exe` captures stdout via a pipe regardless.)
+            try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
             try
             {
                 if (args.Contains("--list-devices")) return ListDevices();
