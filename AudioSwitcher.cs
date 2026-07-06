@@ -21,6 +21,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Management;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -44,8 +45,9 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 5;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 6;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
+        public bool CheckForUpdates { get; set; } = true;    // check GitHub Releases at startup (notify only)
         public int Channels { get; set; } = 2;
         public int IdleTier { get; set; } = 0;
         public int CrashThresholdSeconds { get; set; } = 25;
@@ -1092,6 +1094,44 @@ namespace AudioSwitcher
     }
 
     // ====================================================================
+    // UPDATE CHECK - queries the public GitHub Releases API (no auth), notify-only
+    // ====================================================================
+    public static class UpdateChecker
+    {
+        private const string LatestApi = "https://api.github.com/repos/thetrueartist/Audio-Switcher/releases/latest";
+        public const string ReleasesPage = "https://github.com/thetrueartist/Audio-Switcher/releases/latest";
+        private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
+
+        static UpdateChecker() { _http.DefaultRequestHeaders.UserAgent.ParseAdd("AudioSwitcher-UpdateCheck"); }
+
+        // Returns the latest release version (e.g. "1.2.0") if it's NEWER than 'current', else "".
+        public static string NewerVersion(string current)
+        {
+            try
+            {
+                string json = _http.GetStringAsync(LatestApi).GetAwaiter().GetResult();
+                using var doc = JsonDocument.Parse(json);
+                string tag = doc.RootElement.GetProperty("tag_name").GetString() ?? "";
+                string latest = tag.TrimStart('v', 'V');
+                return IsNewer(latest, current) ? latest : "";
+            }
+            catch { return ""; }   // no network / rate-limited / parse fail -> silently skip
+        }
+
+        private static bool IsNewer(string a, string b)   // dotted-numeric compare: is a > b?
+        {
+            var pa = a.Split('.'); var pb = b.Split('.');
+            for (int i = 0; i < Math.Max(pa.Length, pb.Length); i++)
+            {
+                int x = i < pa.Length && int.TryParse(pa[i], out var xi) ? xi : 0;
+                int y = i < pb.Length && int.TryParse(pb[i], out var yi) ? yi : 0;
+                if (x != y) return x > y;
+            }
+            return false;
+        }
+    }
+
+    // ====================================================================
     // FULLSCREEN GAME DETECTION - low-FP "this is a game" signal for auto-learn
     // ====================================================================
     public static class Foreground
@@ -1169,6 +1209,7 @@ namespace AudioSwitcher
         public string CurrentFormat => $"{_lastApplied.Rate} Hz / {_lastApplied.Bits}-bit";
         public int CurrentRate => _lastApplied.Rate;
         public bool AtIdle { get { lock (_lock) return _running.Count == 0; } }
+        public string UpdateVersion { get; private set; } = "";   // set if a newer release exists ("" = up to date/unknown)
         // True when the currently-applied format equals the idle/audiophile tier - i.e. NOT lowered.
         public bool CurrentIsIdleFormat
         {
@@ -1253,6 +1294,18 @@ namespace AudioSwitcher
             _ipcThread.Start();
             _autoLearnThread = new Thread(AutoLearnPump) { IsBackground = true, Name = "AutoLearn" };
             _autoLearnThread.Start();
+
+            // Background update check (GitHub Releases API, notify only) - never blocks startup.
+            if (_config.CheckForUpdates)
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        string v = UpdateChecker.NewerVersion(Program.AppVersion());
+                        if (!string.IsNullOrEmpty(v)) { UpdateVersion = v; Log($"Update available: v{v} (you have v{Program.AppVersion()})"); }
+                    }
+                    catch { }
+                });
 
             Log("Active. Ctrl-C to exit.");
             Log("");
@@ -1824,6 +1877,7 @@ namespace AudioSwitcher
             var menu = new ContextMenuStrip();
             var hdr = new ToolStripMenuItem("AudioSwitcher v" + Program.AppVersion()) { Enabled = false };
             var open = new ToolStripMenuItem("Open control panel...") { Font = new Font(SystemFonts.MenuFont ?? SystemFonts.DefaultFont, FontStyle.Bold) };
+            var update = new ToolStripMenuItem("") { Visible = false, ForeColor = Color.FromArgb(30, 120, 40) };
             var status = new ToolStripMenuItem("starting...") { Enabled = false };
             var games = new ToolStripMenuItem("No games running") { Enabled = false };
             var pause = new ToolStripMenuItem("Pause switching");
@@ -1841,6 +1895,8 @@ namespace AudioSwitcher
             void OpenWindow() => MainWindow.ShowSingleton(daemon);
             open.Click += (_, __) => OpenWindow();
             tray.DoubleClick += (_, __) => OpenWindow();
+            void OpenReleases() { try { Process.Start(new ProcessStartInfo { FileName = UpdateChecker.ReleasesPage, UseShellExecute = true }); } catch { } }
+            update.Click += (_, __) => OpenReleases();
             pause.Click += (_, __) => { daemon.SetPaused(!daemon.Paused); };
             logs.Click += (_, __) =>
             {
@@ -1855,7 +1911,7 @@ namespace AudioSwitcher
 
             menu.Items.AddRange(new ToolStripItem[]
             {
-                hdr, new ToolStripSeparator(), open, status, games,
+                hdr, update, new ToolStripSeparator(), open, status, games,
                 new ToolStripSeparator(), pause, logs,
                 new ToolStripSeparator(), quit
             });
@@ -1863,6 +1919,7 @@ namespace AudioSwitcher
             // Refresh the icon colour, tooltip and menu every second.
             var timer = new System.Windows.Forms.Timer { Interval = 1000 };
             Color lastColor = Green;
+            bool updateNotified = false;
             timer.Tick += (_, __) =>
             {
                 // Green = at full/idle quality (even if a game is running), amber = actually lowered, grey = paused.
@@ -1878,6 +1935,19 @@ namespace AudioSwitcher
                 games.Text = g.Count == 0 ? "No games running" : string.Join("\n", g);
                 pause.Checked = daemon.Paused;
                 pause.Text = daemon.Paused ? "Resume switching" : "Pause switching";
+
+                // Update notification (set by the background check).
+                if (!string.IsNullOrEmpty(daemon.UpdateVersion))
+                {
+                    update.Text = $"Update available: v{daemon.UpdateVersion}  (click to get it)";
+                    update.Visible = true;
+                    if (!updateNotified)
+                    {
+                        updateNotified = true;
+                        try { tray.BalloonTipTitle = "AudioSwitcher update available";
+                              tray.BalloonTipText = $"v{daemon.UpdateVersion} is out (you have v{Program.AppVersion()}). Click the tray icon."; tray.ShowBalloonTip(6000); } catch { }
+                    }
+                }
 
                 if (c != lastColor)
                 {
@@ -1966,6 +2036,7 @@ namespace AudioSwitcher
         private readonly ListBox _games = new() { IntegralHeight = false };
         private readonly ListBox _overrides = new() { IntegralHeight = false };
         private readonly Button _btnPause = new();
+        private readonly LinkLabel _lblUpdate = new() { AutoSize = true, Visible = false, LinkColor = Color.FromArgb(30, 120, 40) };
         private readonly CheckBox _chkAuto = new() { Text = "Start automatically at logon", AutoSize = true };
         private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
         private bool _syncingAuto;
@@ -1997,6 +2068,9 @@ namespace AudioSwitcher
             var by = new Label { Text = "v" + Program.AppVersion() + "    by @thetrueartist", AutoSize = true, ForeColor = Color.Gray,
                 Location = new Point(x + 2, y + 30) };
             Controls.Add(by);
+            _lblUpdate.Location = new Point(x + 2, y + 48);
+            _lblUpdate.Click += (_, __) => { try { Process.Start(new ProcessStartInfo { FileName = UpdateChecker.ReleasesPage, UseShellExecute = true }); } catch { } };
+            Controls.Add(_lblUpdate);
             y += 58;
 
             _lblDevice.Location = new Point(x, y); Controls.Add(_lblDevice); y += 24;
@@ -2055,6 +2129,13 @@ namespace AudioSwitcher
             _lblState.Text = "State:  " + state;
             _lblState.ForeColor = stateColor;
             _btnPause.Text = _d.Paused ? "Resume switching" : "Pause switching";
+
+            if (!string.IsNullOrEmpty(_d.UpdateVersion))
+            {
+                _lblUpdate.Text = $"Update available: v{_d.UpdateVersion} - click to download";
+                _lblUpdate.Visible = true;
+            }
+            else _lblUpdate.Visible = false;
 
             var g = _d.RunningGameNames();
             SyncList(_games, g.Count == 0 ? new List<string> { "(none)" } : g);
@@ -2138,6 +2219,14 @@ namespace AudioSwitcher
             try
             {
                 if (args.Contains("--version")) { Console.WriteLine($"AudioSwitcher {AppVersion()}"); return 0; }
+                if (args.Contains("--check-update"))
+                {
+                    string v = UpdateChecker.NewerVersion(AppVersion());
+                    Console.WriteLine(string.IsNullOrEmpty(v)
+                        ? $"Up to date (v{AppVersion()})."
+                        : $"Update available: v{v} (you have v{AppVersion()}).  {UpdateChecker.ReleasesPage}");
+                    return 0;
+                }
                 if (args.Contains("--list-devices")) return ListDevices();
                 if (args.Contains("--dump-active"))   return DumpProps();
                 int miIdx = Array.IndexOf(args, "--make-icon");

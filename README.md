@@ -112,6 +112,9 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
 
 - `TargetDeviceName` — **empty = current default playback device**; set a name substring
   (e.g. `"FiiO K7"`) to pin one endpoint.
+- `CheckForUpdates` — check the GitHub Releases API at startup and show a notification if a
+  newer version exists (default true; notify only, never auto-installs). `--check-update` on
+  the CLI does the same on demand.
 - `ProfileTiers`, `EngineDefaults`, `KnownQuirky` — the ladder, per-engine start tier,
   hardcoded per-exe tiers.
 - `LauncherProcesses` / `GamePathHints` — how games are detected. `GameProcesses` — exe
