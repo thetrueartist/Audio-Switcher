@@ -44,7 +44,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 2;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 3;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public int Channels { get; set; } = 2;
         public int IdleTier { get; set; } = 0;
@@ -123,8 +123,24 @@ namespace AudioSwitcher
             @"\Riot Games\", @"\EA Games\", @"\EA\", @"\Origin Games\",
             @"\Ubisoft\Ubisoft Game Launcher\games\",
             @"\Battle.net\", @"\Blizzard\", @"\Rockstar Games\",
-            @"\WindowsApps\", @"\ModifiableWindowsApps\",
+            // NOT plain \WindowsApps\ - that matches every Store app (Snipping Tool, Calculator...).
+            // Game Pass games live under XboxGames or ModifiableWindowsApps.
+            @"\XboxGames\", @"\ModifiableWindowsApps\",
             @"\Amazon Games\Library\"
+        };
+
+        // Never treated as games even if they match a path/launcher rule. Launcher infrastructure
+        // and helper processes (Steam's own web helper / overlay), crash handlers, and common
+        // non-game Store apps that live in WindowsApps.
+        public List<string> IgnoreProcesses { get; set; } = new()
+        {
+            "steamwebhelper.exe", "gameoverlayui64.exe", "gameoverlayui.exe",
+            "steamerrorreporter.exe", "steamservice.exe", "streaming_client.exe",
+            "crashhandler.exe", "crashhandler64.exe", "crashpad_handler.exe",
+            "CrashReportClient.exe", "EpicWebHelper.exe", "UnrealCEFSubProcess.exe",
+            "EABackgroundService.exe", "SnippingTool.exe", "ScreenClippingHost.exe",
+            "ScreenSketch.exe", "Calculator.exe", "Microsoft.Photos.exe",
+            "WindowsTerminal.exe", "Notepad.exe"
         };
     }
 
@@ -821,6 +837,11 @@ namespace AudioSwitcher
         {
             if (string.IsNullOrEmpty(exePath)) return null;
 
+            // Denylist first: launcher helpers / crash handlers / non-game Store apps are never games.
+            string fileName = Path.GetFileName(exePath);
+            if (cfg.IgnoreProcesses.Any(n => string.Equals(n, fileName, StringComparison.OrdinalIgnoreCase)))
+                return null;
+
             foreach (var hint in cfg.GamePathHints)
             {
                 if (exePath.IndexOf(hint, StringComparison.OrdinalIgnoreCase) >= 0)
@@ -967,6 +988,7 @@ namespace AudioSwitcher
             c.EngineDefaults ??= d.EngineDefaults;
             c.LauncherProcesses ??= d.LauncherProcesses;
             c.GamePathHints ??= d.GamePathHints;
+            c.IgnoreProcesses ??= d.IgnoreProcesses;
             c.KnownQuirky ??= d.KnownQuirky;
             return c;
         }
@@ -1095,6 +1117,11 @@ namespace AudioSwitcher
         public string CurrentFormat => $"{_lastApplied.Rate} Hz / {_lastApplied.Bits}-bit";
         public int CurrentRate => _lastApplied.Rate;
         public bool AtIdle { get { lock (_lock) return _running.Count == 0; } }
+        // True when the currently-applied format equals the idle/audiophile tier - i.e. NOT lowered.
+        public bool CurrentIsIdleFormat
+        {
+            get { var idle = _config.ProfileTiers[_config.IdleTier]; return _lastApplied.Rate == idle.Rate && _lastApplied.Bits == idle.Bits; }
+        }
         public bool Paused { get; private set; }
         public List<string> RunningGameNames()
         {
@@ -1732,8 +1759,10 @@ namespace AudioSwitcher
             Color lastColor = Green;
             timer.Tick += (_, __) =>
             {
-                Color c = daemon.Paused ? Grey : (daemon.AtIdle ? Green : Amber);
-                string state = daemon.Paused ? "paused" : (daemon.AtIdle ? "idle" : "game running");
+                // Green = at full/idle quality (even if a game is running), amber = actually lowered, grey = paused.
+                Color c = daemon.Paused ? Grey : (daemon.CurrentIsIdleFormat ? Green : Amber);
+                string state = daemon.Paused ? "paused"
+                    : (daemon.AtIdle ? "idle" : (daemon.CurrentIsIdleFormat ? "game running, full quality" : "game running, lowered"));
                 string tip = $"AudioSwitcher\n{daemon.CurrentFormat}  ({state})";
                 if (tip.Length > 127) tip = tip.Substring(0, 127);
                 tray.Text = tip;
@@ -1898,8 +1927,14 @@ namespace AudioSwitcher
         {
             _lblDevice.Text = "Device:  " + _d.DeviceName;
             _lblFormat.Text = "Now:  " + _d.CurrentFormat;
-            string state = _d.Paused ? "Paused (holding idle)" : (_d.AtIdle ? "Idle - audiophile profile" : "Game running - format lowered");
+            string state;
+            Color stateColor = Color.Black;
+            if (_d.Paused) { state = "Paused (holding idle)"; stateColor = Color.FromArgb(110, 118, 129); }
+            else if (_d.AtIdle) { state = "Idle - audiophile profile"; stateColor = Color.FromArgb(46, 130, 70); }
+            else if (_d.CurrentIsIdleFormat) { state = "Game running - full quality (not lowered)"; stateColor = Color.FromArgb(46, 130, 70); }
+            else { state = "Game running - lowered to " + _d.CurrentFormat; stateColor = Color.FromArgb(180, 120, 10); }
             _lblState.Text = "State:  " + state;
+            _lblState.ForeColor = stateColor;
             _btnPause.Text = _d.Paused ? "Resume switching" : "Pause switching";
 
             var g = _d.RunningGameNames();
