@@ -47,7 +47,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 6;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 7;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public bool CheckForUpdates { get; set; } = true;    // check GitHub Releases at startup (notify only)
         public int Channels { get; set; } = 2;
@@ -57,9 +57,10 @@ namespace AudioSwitcher
         public int GlitchWindowSeconds { get; set; } = 30;
         // Silence detection: a game whose audio session is Active but whose peak meter stays
         // silent this many seconds (after the grace period, never having produced sound) is
-        // treated as "format unusable" and bumped down. 0 = OFF (default). Enable by setting
-        // e.g. 15 once `--sessions` confirms it reads your games' peak meter.
-        public int SilenceWindowSeconds { get; set; } = 0;
+        // treated as "format unusable" and bumped down. ON by default (15s). Safe because the
+        // daemon self-verifies the peak meter works (sees it read >0) before ever acting, so a
+        // broken meter can't wrongly flag games. 0 = off.
+        public int SilenceWindowSeconds { get; set; } = 15;
         public int SilenceGraceSeconds { get; set; } = 25;
         // Auto-learn games: if an EXCLUSIVE-fullscreen Direct3D app (a strong, low-false-positive
         // "this is a game" signal - browsers/video/desktop apps don't use exclusive fullscreen)
@@ -1708,6 +1709,14 @@ namespace AudioSwitcher
                     lock (_lock) { games = _running.Values.ToList(); }
                     var sessions = games.Count > 0 ? EndpointManager.GetSessions() : null;
                     var now = DateTime.Now;
+                    // Self-verify the peak meter: if ANY session ever reads > 0, the reader works.
+                    // We only ACT on silence once verified - so a broken/zero-reading meter can NEVER
+                    // wrongly flag every game. This is what makes on-by-default safe.
+                    if (sessions != null && sessions.Any(x => x.Peak > 0.0005f) && !_meterEverPositive)
+                    {
+                        _meterEverPositive = true;
+                        if (_verbose) Log("Silence detection: peak meter verified working");
+                    }
                     if (sessions != null)
                         foreach (var g in games)
                         {
@@ -1717,7 +1726,7 @@ namespace AudioSwitcher
                             if (s.State == 1 && s.Peak > 0.0005f) { g.SawAudio = true; g.SilentSince = null; continue; }
                             if (!(s.State == 1 && s.Peak <= 0.0005f)) { g.SilentSince = null; continue; }  // no Active session -> don't flag
                             g.SilentSince ??= now;
-                            if ((now - g.SilentSince.Value).TotalSeconds >= _config.SilenceWindowSeconds)
+                            if ((now - g.SilentSince.Value).TotalSeconds >= _config.SilenceWindowSeconds && _meterEverPositive)
                             {
                                 Log($"! {g.Exe}: session Active but silent {_config.SilenceWindowSeconds}s -> format likely unusable");
                                 g.Failed = true;
@@ -1736,6 +1745,7 @@ namespace AudioSwitcher
         }
 
         private DateTime _lastSilenceCheck = DateTime.MinValue;
+        private bool _meterEverPositive;   // set once we've seen the peak meter read >0 (proves it works)
 
         // Auto-learn: watch for an exclusive-fullscreen D3D app that isn't already known, and after
         // it stays foreground long enough, add its exe to GameProcesses so its NEXT launch is caught

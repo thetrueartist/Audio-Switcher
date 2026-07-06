@@ -125,8 +125,10 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
   next launch is caught early. Low false-positive (only exclusive fullscreen, which browsers/
   video don't use), and a false-add is harmless (the app is tracked, not altered).
 - `CrashThresholdSeconds`, `GlitchThreshold`, `GlitchWindowSeconds` — learning sensitivity.
-- `SilenceWindowSeconds` — **0 = off**; set e.g. `15` to enable silence learning (verify
-  with `--sessions` first). `SilenceGraceSeconds` ignores the first N seconds (loading).
+- `SilenceWindowSeconds` — **on by default (15s)**: a game that comes up Active but silent
+  for this long gets bumped down. Safe on-by-default because the daemon self-verifies the
+  peak meter reads sound before ever acting (a broken meter can't misfire). 0 = off.
+  `SilenceGraceSeconds` ignores the first N seconds (loading).
 - `ProbeEveryLaunches` — **0 = off**; set e.g. `5` to enable the upward probe.
 
 Config is validated on load (bad values can't crash it) and regenerated if it's from an
