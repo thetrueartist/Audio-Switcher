@@ -45,7 +45,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$InstallDir = "$env:LOCALAPPDATA\AudioSwitcher\bin"
+# Install under Program Files (admin-only-writable). The daemon runs ELEVATED at logon, so its
+# binary must NOT sit in a user-writable path - otherwise any process running as the user could
+# overwrite it and gain elevated code execution at the next logon (local privilege escalation).
+# Learned state stays in %LOCALAPPDATA%\AudioSwitcher (per-user, user-writable) - only the exe moves.
+$InstallDir = "$env:ProgramFiles\AudioSwitcher"
+$OldInstallDir = "$env:LOCALAPPDATA\AudioSwitcher\bin"   # pre-1.4 location, cleaned up on (un)install
 $Exe = "$InstallDir\AudioSwitcher.exe"
 $SourceCs = "$ScriptDir\AudioSwitcher.cs"
 $TaskName = "AudioSwitcherDaemon"
@@ -96,6 +101,7 @@ function Find-Csc {
 }
 
 function Build-Exe {
+    Assert-Admin   # $InstallDir is Program Files now - writing there needs elevation
     if (-not (Test-Path $SourceCs)) {
         Write-Error "Source not found: $SourceCs"
         exit 1
@@ -167,6 +173,11 @@ function Install-Task {
     # Stop any running/old instance FIRST - otherwise the exe is locked (can't overwrite) and
     # the single-instance guard would make the freshly-installed one exit immediately.
     Stop-Daemon
+    # Migrate off the pre-1.4 user-writable location (the EoP we're fixing): delete the old exe/dir.
+    if (Test-Path $OldInstallDir) {
+        Write-Host "  Removing old user-writable install ($OldInstallDir)..." -ForegroundColor DarkGray
+        Remove-Item $OldInstallDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if (-not (Ensure-Exe)) { return }
 
     # Remove old task if it exists
@@ -220,10 +231,11 @@ function Uninstall-Task {
         Write-Host "Removing scheduled task..." -ForegroundColor Yellow
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
-    if (Test-Path $Exe) {
-        Write-Host "Deleting $Exe..." -ForegroundColor Yellow
-        Remove-Item $Exe -Force
+    if (Test-Path $InstallDir) {
+        Write-Host "Deleting $InstallDir..." -ForegroundColor Yellow
+        Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+    if (Test-Path $OldInstallDir) { Remove-Item $OldInstallDir -Recurse -Force -ErrorAction SilentlyContinue }
     Remove-Item (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\AudioSwitcher.lnk") -Force -ErrorAction SilentlyContinue
     Write-Host "Done. State files in $env:LOCALAPPDATA\AudioSwitcher\ are preserved." -ForegroundColor Green
     Write-Host "Delete that folder manually if you want a clean slate." -ForegroundColor DarkGray

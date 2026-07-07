@@ -1303,6 +1303,17 @@ namespace AudioSwitcher
         private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromMinutes(5) };
         static SelfUpdate() { _http.DefaultRequestHeaders.UserAgent.ParseAdd("AudioSwitcher-SelfUpdate"); }
 
+        // Stage the download/extract/restart-helper in a subfolder of the install dir - NOT %TEMP%,
+        // which is world-writable. An elevated updater must never read-then-execute files that a
+        // normal-privilege process could swap in between the hash check and the run (TOCTOU -> EoP).
+        // Once installed under Program Files, this folder inherits its admin-only-write ACL.
+        private static string StagingDir()
+        {
+            string exe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+            string baseDir = exe.Length > 0 ? (Path.GetDirectoryName(exe) ?? Path.GetTempPath()) : Path.GetTempPath();
+            return Path.Combine(baseDir, "update");
+        }
+
         // Downloads the zip, verifies its hash, and applies it. Returns "" on success (caller must
         // then quit - the helper restarts the new exe), or an error string (nothing was changed).
         public static string DownloadAndApply(string zipUrl, string expectedSha256, Action<string>? log = null)
@@ -1310,7 +1321,7 @@ namespace AudioSwitcher
             try
             {
                 if (string.IsNullOrEmpty(zipUrl)) return "no download URL";
-                string tmp = Path.Combine(Path.GetTempPath(), "AudioSwitcherUpdate");
+                string tmp = StagingDir();
                 Directory.CreateDirectory(tmp);
                 string zipPath = Path.Combine(tmp, "update.zip");
                 log?.Invoke("Downloading update...");
@@ -1365,7 +1376,7 @@ namespace AudioSwitcher
 
                 // Helper: wait for THIS process to exit, then start the new exe and remove .old.
                 int pid = Process.GetCurrentProcess().Id;
-                string helper = Path.Combine(Path.GetTempPath(), "AudioSwitcherUpdate", "restart.cmd");
+                string helper = Path.Combine(StagingDir(), "restart.cmd");
                 File.WriteAllText(helper,
                     "@echo off\r\n" +
                     ":wait\r\n" +
@@ -2187,23 +2198,45 @@ namespace AudioSwitcher
                                 writer.WriteLine($"game={g.Exe};engine={g.Engine};tier={g.TierIdx};rate={g.Profile.Rate};bits={g.Profile.Bits}");
                         }
                     }
+                    else if (cmd == "reload")
+                    {
+                        ReloadLists();   // pick up --exclude / --unexclude edits without a restart
+                        Log("Reloaded exclusion / game lists from config.");
+                    }
                     writer.WriteLine("END");
                 }
                 catch { if (!_shutdown.IsSet) Thread.Sleep(1000); }
             }
         }
 
+        // Refresh the mutable name lists (exclusions / game allowlist) from config.json without a
+        // restart - used after the CLI edits them (--exclude/--unexclude). Mirrors how auto-learn
+        // already mutates _config.GameProcesses live on this same daemon instance.
+        public void ReloadLists()
+        {
+            try
+            {
+                var fresh = StateStore.LoadConfig();
+                _config.IgnoreProcesses.Clear(); _config.IgnoreProcesses.AddRange(fresh.IgnoreProcesses);
+                _config.GameProcesses.Clear();   _config.GameProcesses.AddRange(fresh.GameProcesses);
+            }
+            catch { }
+        }
+
         // The daemon runs elevated (scheduled task, Highest), so a normal-privilege client
-        // (.\AudioSwitcher.ps1 -Status) can't open a default-ACL pipe -> "Access denied".
-        // Grant Authenticated Users read/write so status queries work without elevation.
+        // (.\AudioSwitcher.ps1 -Status, or re-opening the exe) can't open a default-ACL pipe ->
+        // "Access denied". Grant only the CURRENT USER read/write - enough for the same-user client
+        // at any integrity level, but not other users on a shared machine (tighter than Authenticated
+        // Users, which the harmless showgui/status commands don't need exposed that widely).
         private static NamedPipeServerStream CreatePipe()
         {
             try
             {
                 var sec = new System.IO.Pipes.PipeSecurity();
+                var me = System.Security.Principal.WindowsIdentity.GetCurrent().User;
+                if (me == null) throw new InvalidOperationException("no current-user SID");
                 sec.AddAccessRule(new System.IO.Pipes.PipeAccessRule(
-                    new System.Security.Principal.SecurityIdentifier(
-                        System.Security.Principal.WellKnownSidType.AuthenticatedUserSid, null),
+                    me,
                     System.IO.Pipes.PipeAccessRights.ReadWrite,
                     System.Security.AccessControl.AccessControlType.Allow));
                 return NamedPipeServerStreamAcl.Create("AudioSwitcherPipe", PipeDirection.InOut, 1,
@@ -2431,10 +2464,31 @@ namespace AudioSwitcher
 
         public static bool IsEnabled() => Run($"/query /tn \"{TaskName}\"") == 0;
 
+        // Program Files\AudioSwitcher\AudioSwitcher.exe - admin-only-writable, so a normal user
+        // can't replace the binary that the task runs ELEVATED at logon (that would be a local EoP).
+        public static string SecureExePath() =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                         "AudioSwitcher", "AudioSwitcher.exe");
+
         public static void Enable()
         {
-            string exe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
-            if (exe.Length == 0) return;
+            // Register the task against the admin-only Program Files copy, relocating the exe there
+            // if we're running from somewhere user-writable. If we can't write Program Files (e.g. not
+            // elevated), fall back to the current path so the feature still works.
+            string cur = Process.GetCurrentProcess().MainModule?.FileName ?? "";
+            if (cur.Length == 0) return;
+            string exe = cur;
+            try
+            {
+                string dst = SecureExePath();
+                if (!string.Equals(cur, dst, StringComparison.OrdinalIgnoreCase))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(dst)!);   // inherits PF admin-only ACL
+                    File.Copy(cur, dst, true);
+                    exe = dst;
+                }
+            }
+            catch { exe = cur; }
             Run($"/create /tn \"{TaskName}\" /tr \"\\\"{exe}\\\"\" /sc onlogon /rl highest /f");
         }
 
@@ -2762,6 +2816,12 @@ namespace AudioSwitcher
                 if (lockIdx >= 0 && lockIdx + 2 < args.Length)
                     return LockProfile(args[lockIdx + 1], int.Parse(args[lockIdx + 2]));
 
+                int exIdx = Array.IndexOf(args, "--exclude");
+                if (exIdx >= 0 && exIdx + 1 < args.Length) return SetExcluded(args[exIdx + 1], true);
+                int unexIdx = Array.IndexOf(args, "--unexclude");
+                if (unexIdx >= 0 && unexIdx + 1 < args.Length) return SetExcluded(args[unexIdx + 1], false);
+                if (args.Contains("--list-excluded")) return ListExcluded();
+
                 bool verbose = args.Contains("--verbose");
                 var cfg = StateStore.LoadConfig();
                 var ep = EndpointManager.Resolve(cfg);
@@ -2992,6 +3052,42 @@ namespace AudioSwitcher
             };
             StateStore.SaveOverrides(ov);
             Console.WriteLine($"Locked {exe} -> tier {tier} ({t.Rate}/{t.Bits})");
+            return 0;
+        }
+
+        // Exclusions: add/remove an exe from IgnoreProcesses (the "never manage this" denylist that
+        // every detection path already honours). Excluding also drops any learned override and game-
+        // allowlist entry, so the app is genuinely left alone. Signals the running daemon to reload.
+        private static int SetExcluded(string exe, bool add)
+        {
+            if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exe += ".exe";
+            var cfg = StateStore.LoadConfig();
+            bool has = cfg.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+            if (add)
+            {
+                if (!has) cfg.IgnoreProcesses.Add(exe);
+                cfg.GameProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+                StateStore.Save(cfg, StateStore.ConfigFile);
+                var ov = StateStore.LoadOverrides();
+                if (ov.Remove(exe)) StateStore.SaveOverrides(ov);
+                Console.WriteLine(has ? $"{exe} is already excluded." : $"Excluded {exe} - AudioSwitcher will never manage it.");
+            }
+            else
+            {
+                if (has) { cfg.IgnoreProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase)); StateStore.Save(cfg, StateStore.ConfigFile); }
+                Console.WriteLine(has ? $"Un-excluded {exe}." : $"{exe} was not excluded.");
+            }
+            SendPipe("reload");   // apply to the running daemon immediately (no restart needed)
+            return 0;
+        }
+
+        private static int ListExcluded()
+        {
+            var cfg = StateStore.LoadConfig();
+            if (cfg.IgnoreProcesses.Count == 0) { Console.WriteLine("No exclusions."); return 0; }
+            Console.WriteLine("Excluded (never managed):");
+            foreach (var n in cfg.IgnoreProcesses.OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
+                Console.WriteLine("  " + n);
             return 0;
         }
 

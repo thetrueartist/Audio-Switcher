@@ -14,6 +14,7 @@ taskkill /f /im AudioSwitcher.exe >nul 2>nul
 echo Removing auto-start task...
 schtasks /delete /tn AudioSwitcherDaemon /f >nul 2>nul
 echo Deleting program files...
+rmdir /s /q "%ProgramFiles%\AudioSwitcher" >nul 2>nul
 rmdir /s /q "%LOCALAPPDATA%\AudioSwitcher\bin" >nul 2>nul
 del "%APPDATA%\Microsoft\Windows\Start Menu\Programs\AudioSwitcher.lnk" >nul 2>nul
 

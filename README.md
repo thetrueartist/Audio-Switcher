@@ -217,12 +217,23 @@ dotnet publish AudioSwitcher.csproj -c Release -r win-x64 --self-contained false
 Diagnostics (run the exe directly) — handy when adding support for a new device:
 
 ```powershell
-$e = "$env:LOCALAPPDATA\AudioSwitcher\bin\AudioSwitcher.exe"
+$e = "$env:ProgramFiles\AudioSwitcher\AudioSwitcher.exe"
 & $e --list-devices     # endpoints (active marked *), with GUIDs
 & $e --probe-format     # the device's current + mix WAVEFORMAT
 & $e --set-format 192000 32   # apply a format directly (test what the device accepts)
 & $e --sessions         # audio sessions on the default device (pid / state / peak)
 ```
+
+**Exclusions** — tell AudioSwitcher to never manage an app (leaves its format alone):
+
+```powershell
+& $e --exclude Game.exe       # never touch this app (also drops any learned profile for it)
+& $e --unexclude Game.exe     # start managing it again
+& $e --list-excluded          # show the exclusion list
+```
+
+The binary installs to `%ProgramFiles%\AudioSwitcher` (admin-only — it runs elevated at logon, so it
+must not be user-writable); learned state stays in `%LOCALAPPDATA%\AudioSwitcher`.
 
 ## License
 

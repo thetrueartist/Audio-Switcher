@@ -24,7 +24,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Building AudioSwitcher...
-dotnet publish "%~dp0AudioSwitcher.csproj" -c Release -r win-x64 --self-contained false -o "%LOCALAPPDATA%\AudioSwitcher\bin"
+dotnet publish "%~dp0AudioSwitcher.csproj" -c Release -r win-x64 --self-contained false -o "%LOCALAPPDATA%\AudioSwitcher\build"
 if errorlevel 1 (
   echo.
   echo   Build FAILED - see the messages above.
@@ -32,7 +32,8 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo   Built: %LOCALAPPDATA%\AudioSwitcher\bin\AudioSwitcher.exe
-echo   Next: run Install.cmd for auto-start, or double-click the exe for the tray icon.
+echo   Built (dev copy): %LOCALAPPDATA%\AudioSwitcher\build\AudioSwitcher.exe
+echo   To install with auto-start, run Install.cmd (installs to Program Files, elevated).
+echo   Or double-click the dev exe above for the tray icon.
 echo.
 pause
