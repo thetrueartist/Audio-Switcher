@@ -1,0 +1,38 @@
+name: branch-build
+
+# Test builds for non-main branches. Produces a downloadable zip ARTIFACT (not a GitHub release),
+# so it never shows up as "latest" and never notifies users via the in-app update check. Use it to
+# validate a branch on a real Windows rig before merging to main.
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # Self-contained single-file exe: run it with no .NET install required (same as a release).
+      - name: Publish (self-contained win-x64)
+        shell: pwsh
+        run: |
+          dotnet publish AudioSwitcher.csproj -c Release -r win-x64 `
+            --self-contained true -p:PublishSingleFile=true -o publish
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item publish/AudioSwitcher.exe dist/
+          Copy-Item *.cmd, *.ps1, README.md, LICENSE dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioSwitcher-${{ github.ref_name }}
+          path: dist/*
