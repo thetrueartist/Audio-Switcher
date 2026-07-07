@@ -194,6 +194,7 @@ namespace AudioSwitcher
         public bool Locked { get; set; }
         public string Updated { get; set; } = "";
         public int Launches { get; set; }   // launches since last upward probe
+        public bool NotRateRelated { get; set; }   // silent even at the lowest pre-set rate -> not a rate issue; stop dropping it
     }
 
     // ====================================================================
@@ -1395,6 +1396,8 @@ namespace AudioSwitcher
         public bool SawAudio;           // latched true once the game produces any sound
         public bool IsProbe;            // this launch is an upward probe (one tier above the learned override)
         public bool Failed;             // a crash/glitch/silence bump fired this session
+        public bool CleanPreset;        // we set the format BEFORE this game opened audio (froze it at kernel-speed detect)
+        public bool GaveUp;             // concluded its silence isn't rate-related -> stop re-judging it this session
     }
 
     // Optional game freeze across a format switch. Suspending every thread of the game the instant
@@ -1670,7 +1673,7 @@ namespace AudioSwitcher
             if (started.HasValue)
                 Log($"ETW caught {exe} {(int)(DateTime.Now - started.Value).TotalMilliseconds}ms after launch");
             RegisterAndApply(pid, exe, "", ov?.Engine ?? "", ov, overrides,
-                             ov != null ? "override/etw" : "known-quirky/etw", allowSuspend: true);
+                             ov != null ? "override/etw" : "known-quirky/etw", allowSuspend: true, earlyDetect: true);
         }
 
         private void OnProcessStart(object? sender, EventArrivedEventArgs e)
@@ -1733,7 +1736,7 @@ namespace AudioSwitcher
         // open its audio device at the old rate first (the definitive fix for switch-too-slow).
         private void RegisterAndApply(int pid, string exe, string path, string engine,
                                       OverrideEntry? ovEntry, Dictionary<string, OverrideEntry> overrides,
-                                      string reason, bool allowSuspend)
+                                      string reason, bool allowSuspend, bool earlyDetect = false)
         {
             var profile = ResolveProfile(exe, engine);
             int tier = profile.tier, rate = profile.rate, bits = profile.bits;
@@ -1787,6 +1790,11 @@ namespace AudioSwitcher
                                               : $"  freeze failed for {exe} (applying anyway)");
                 }
             }
+            // A "clean pre-set" = we froze the game at kernel-speed (ETW) detection, so the new format
+            // was live BEFORE it opened audio. Only then does lasting silence prove the rate isn't the
+            // cause (see SilencePolicy). A late WMI-path freeze doesn't qualify.
+            if (earlyDetect && frozen != IntPtr.Zero)
+                lock (_lock) { if (_running.TryGetValue(pid, out var rg)) rg.CleanPreset = true; }
             try { ApplyEffective(); }
             finally { ProcessControl.Resume(frozen); }
         }
@@ -1939,7 +1947,7 @@ namespace AudioSwitcher
                     if (sessions != null)
                         foreach (var g in games)
                         {
-                            if (g.SawAudio) continue;
+                            if (g.SawAudio || g.GaveUp) continue;
                             if ((now - g.StartedAt).TotalSeconds < _config.SilenceGraceSeconds) continue;
                             var matches = sessions.Where(x => x.Pid == (uint)g.Pid).ToList();
                             if (matches.Count == 0) { g.SilentSince = null; continue; }   // no audio session -> can't judge
@@ -1952,16 +1960,38 @@ namespace AudioSwitcher
                             if ((now - g.SilentSince.Value).TotalSeconds >= _config.SilenceWindowSeconds && _meterEverPositive)
                             {
                                 string how = s.State == 1 ? "session Active but silent" : "session never started (Inactive)";
-                                Log($"! {g.Exe}: {how} {_config.SilenceWindowSeconds}s -> format likely unusable");
-                                g.Failed = true;
-                                if (BumpProfileDown(g.Exe, g.Engine, "running but silent"))
-                                {
-                                    var prof = ResolveProfile(g.Exe, g.Engine);
-                                    g.TierIdx = prof.tier;
-                                    g.Profile = new ProfileTier { Rate = prof.rate, Bits = prof.bits };
-                                    ApplyEffective();
-                                }
                                 g.SilentSince = null;
+                                switch (SilencePolicy.Decide(g.TierIdx, _config.ProfileTiers.Count - 1, g.CleanPreset))
+                                {
+                                    case SilenceAction.Bump:
+                                        Log($"! {g.Exe}: {how} {_config.SilenceWindowSeconds}s -> format likely unusable");
+                                        g.Failed = true;
+                                        if (BumpProfileDown(g.Exe, g.Engine, "running but silent"))
+                                        {
+                                            var prof = ResolveProfile(g.Exe, g.Engine);
+                                            g.TierIdx = prof.tier;
+                                            g.Profile = new ProfileTier { Rate = prof.rate, Bits = prof.bits };
+                                            ApplyEffective();
+                                        }
+                                        break;
+                                    case SilenceAction.GiveUpNotRateRelated:
+                                        // Silent even at the lowest rate set BEFORE it opened audio -> the rate
+                                        // was never the cause. Stop dropping for it and let quality return.
+                                        Log($"! {g.Exe}: {how} even at the lowest rate set before launch -> not a sample-rate issue");
+                                        GiveUpOnGame(g.Exe, g.Engine);
+                                        g.GaveUp = true;
+                                        g.TierIdx = _config.IdleTier;
+                                        var idle = _config.ProfileTiers[_config.IdleTier];
+                                        g.Profile = new ProfileTier { Rate = idle.Rate, Bits = idle.Bits };
+                                        ApplyEffective();
+                                        break;
+                                    case SilenceAction.StayPinned:
+                                        // At the floor but we couldn't pre-set cleanly, so we can't be sure the
+                                        // rate isn't it. Leave it pinned, stop re-judging, point at the fix.
+                                        Log($"! {g.Exe}: still silent at the lowest tier (no clean pre-set) - enable SuspendDuringSwitch, or run --exclude {g.Exe}");
+                                        g.GaveUp = true;
+                                        break;
+                                }
                             }
                         }
                 }
@@ -2023,7 +2053,14 @@ namespace AudioSwitcher
 
             var overrides = StateStore.LoadOverrides();
             if (overrides.TryGetValue(exe, out var ov))
+            {
+                if (ov.NotRateRelated)   // decided its silence isn't rate-caused -> don't drop it
+                {
+                    var idleT = _config.ProfileTiers[_config.IdleTier];
+                    return (idleT.Rate, idleT.Bits, _config.IdleTier, "unmanaged (silence not rate-related)");
+                }
                 return (ov.Rate, ov.Bits, Clamp(ov.TierIdx), $"override(locked={ov.Locked})");
+            }
 
             if (_config.KnownQuirky.TryGetValue(exe, out var quirky))
             {
@@ -2035,6 +2072,23 @@ namespace AudioSwitcher
             int idx = Clamp(_config.EngineDefaults.TryGetValue(engine, out var v) ? v : 0);
             var t = _config.ProfileTiers[idx];
             return (t.Rate, t.Bits, idx, $"engine:{engine}");
+        }
+
+        // Concluded a game's silence isn't caused by the sample rate (silent even at the lowest rate
+        // applied BEFORE it opened audio). Stop dropping the format for it - dropping doesn't help and
+        // just costs quality - persist that, and tell the user they can exclude it outright.
+        private void GiveUpOnGame(string exe, string engine)
+        {
+            var overrides = StateStore.LoadOverrides();
+            if (!overrides.TryGetValue(exe, out var ov)) ov = new OverrideEntry { Engine = engine };
+            var idle = _config.ProfileTiers[_config.IdleTier];
+            ov.NotRateRelated = true;
+            ov.TierIdx = _config.IdleTier; ov.Rate = idle.Rate; ov.Bits = idle.Bits;
+            ov.Reason = "silence not rate-related";
+            ov.Updated = DateTime.Now.ToString("o");
+            overrides[exe] = ov;
+            StateStore.SaveOverrides(overrides);
+            Log($"  {exe}: sample rate isn't the cause - no longer dropping the format for it. Run  --exclude {exe}  to ignore it entirely.");
         }
 
         private bool BumpProfileDown(string exe, string engine, string reason)

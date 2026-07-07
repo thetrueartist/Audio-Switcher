@@ -22,8 +22,26 @@ namespace AudioSwitcher.Tests
         {
             Console.WriteLine("AudioSwitcher tests\n");
             SigningTests();
+            SilencePolicyTests();
             Console.WriteLine($"\n{_passed} passed, {_failed} failed");
             return _failed == 0 ? 0 : 1;
+        }
+
+        static void SilencePolicyTests()
+        {
+            Console.WriteLine("\nSilencePolicy (learning: don't drag non-rate-silent games to the floor):");
+            const int lowest = 5;
+
+            Check("mid-ladder + silent -> keep dropping",
+                  SilencePolicy.Decide(1, lowest, true) == SilenceAction.Bump);
+            Check("just above floor -> still drops",
+                  SilencePolicy.Decide(4, lowest, false) == SilenceAction.Bump);
+            Check("floor + clean pre-set + silent -> give up (not rate-related)",
+                  SilencePolicy.Decide(5, lowest, true) == SilenceAction.GiveUpNotRateRelated);
+            Check("floor + NO clean pre-set -> stay pinned (can't conclude)",
+                  SilencePolicy.Decide(5, lowest, false) == SilenceAction.StayPinned);
+            Check("top tier is never immediately given up on",
+                  SilencePolicy.Decide(0, lowest, true) == SilenceAction.Bump);
         }
 
         static void SigningTests()

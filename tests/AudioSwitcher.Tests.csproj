@@ -13,5 +13,6 @@
        framework (keeps the project's zero-deps rule). The runner is a plain console app. -->
   <ItemGroup>
     <Compile Include="../Signing.cs" />
+    <Compile Include="../SilencePolicy.cs" />
   </ItemGroup>
 </Project>
