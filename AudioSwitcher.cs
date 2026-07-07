@@ -2878,6 +2878,18 @@ namespace AudioSwitcher
             }
             menu.Items.Add(setTier);
 
+            var clear = new ToolStripMenuItem("Clear (back to auto)");
+            clear.Click += (_, __) =>
+            {
+                var exe = getExe();
+                if (exe == null) return;
+                var ov = StateStore.LoadOverrides();
+                if (ov.Remove(exe)) StateStore.SaveOverrides(ov);   // drop the lock/learned tier -> default management
+                _d.Reapply(exe);
+                Refresh2();
+            };
+            menu.Items.Add(clear);
+
             return menu;
         }
 
