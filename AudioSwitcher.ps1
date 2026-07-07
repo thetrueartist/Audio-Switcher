@@ -161,8 +161,21 @@ function Ensure-Exe([switch]$Force) {
     $bundled = Join-Path $ScriptDir "AudioSwitcher.exe"
     if (Test-Path $bundled) {
         if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
-        Copy-Item $bundled $Exe -Force
-        Write-Host "  Using bundled AudioSwitcher.exe -> $InstallDir" -ForegroundColor DarkGray
+        # A lingering instance can still hold a lock on $Exe (the ~150 MB self-contained host is slow
+        # to release, and the task's RestartCount can respawn it faster than Stop-Daemon kills it), so a
+        # plain overwrite fails. Windows DOES allow renaming a locked exe, though: move the old one aside
+        # first, then copy the new one into the freed name.
+        if (Test-Path $Exe) {
+            Remove-Item "$Exe.old" -Force -ErrorAction SilentlyContinue
+            try { Move-Item $Exe "$Exe.old" -Force -ErrorAction Stop } catch { }
+        }
+        try { Copy-Item $bundled $Exe -Force -ErrorAction Stop }
+        catch {
+            Write-Error "Could not write $Exe (still running?): $($_.Exception.Message)"
+            return $false
+        }
+        Remove-Item "$Exe.old" -Force -ErrorAction SilentlyContinue   # gone unless still locked; harmless if it lingers
+        Write-Host "  Deployed AudioSwitcher.exe -> $InstallDir" -ForegroundColor DarkGray
         return $true
     }
     if (Test-Path $SourceCs) { Build-Exe; return (Test-Path $Exe) }
@@ -226,12 +239,13 @@ function Install-Task {
 
 function Uninstall-Task {
     Assert-Admin
-    Write-Host "Stopping daemon..." -ForegroundColor Yellow
-    Stop-Daemon
+    # Delete the task FIRST so its auto-restart can't respawn (and re-lock) the daemon while we remove it.
     if (Test-Task) {
         Write-Host "Removing scheduled task..." -ForegroundColor Yellow
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     }
+    Write-Host "Stopping daemon..." -ForegroundColor Yellow
+    Stop-Daemon
     if (Test-Path $InstallDir) {
         Write-Host "Deleting $InstallDir..." -ForegroundColor Yellow
         Remove-Item $InstallDir -Recurse -Force -ErrorAction SilentlyContinue

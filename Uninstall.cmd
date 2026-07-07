@@ -9,10 +9,11 @@ if errorlevel 1 (
   exit /b
 )
 
+echo Removing auto-start task...
+rem Delete the task FIRST so its auto-restart can't respawn (and re-lock) the daemon while we remove it.
+schtasks /delete /tn AudioSwitcherDaemon /f >nul 2>nul
 echo Stopping AudioSwitcher...
 taskkill /f /im AudioSwitcher.exe >nul 2>nul
-echo Removing auto-start task...
-schtasks /delete /tn AudioSwitcherDaemon /f >nul 2>nul
 echo Deleting program files...
 rmdir /s /q "%ProgramFiles%\AudioSwitcher" >nul 2>nul
 rmdir /s /q "%LOCALAPPDATA%\AudioSwitcher\bin" >nul 2>nul
