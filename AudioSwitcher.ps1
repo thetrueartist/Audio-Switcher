@@ -154,8 +154,10 @@ Or: winget install Microsoft.DotNet.SDK.8
 
 # Make sure $Exe exists at the install location. Order: already installed ->
 # prebuilt exe bundled next to this script (the release zip) -> compile from source.
-function Ensure-Exe {
-    if (Test-Path $Exe) { return $true }
+function Ensure-Exe([switch]$Force) {
+    # -Force (used by Install) always deploys the packaged/newest exe, even over an existing install -
+    # otherwise a reinstall would keep running the OLD binary. Without -Force, "an exe exists" is enough.
+    if (-not $Force -and (Test-Path $Exe)) { return $true }
     $bundled = Join-Path $ScriptDir "AudioSwitcher.exe"
     if (Test-Path $bundled) {
         if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null }
@@ -170,21 +172,20 @@ function Ensure-Exe {
 
 function Install-Task {
     Assert-Admin
-    # Stop any running/old instance FIRST - otherwise the exe is locked (can't overwrite) and
-    # the single-instance guard would make the freshly-installed one exit immediately.
+    # Unregister the task FIRST so its auto-restart (RestartCount) can't relaunch the daemon mid-install
+    # - that would re-lock the exe and leave the OLD build running. Then stop any running instance.
+    if (Test-Task) {
+        Write-Host "Removing existing scheduled task..." -ForegroundColor Yellow
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    }
     Stop-Daemon
     # Migrate off the pre-1.4 user-writable location (the EoP we're fixing): delete the old exe/dir.
     if (Test-Path $OldInstallDir) {
         Write-Host "  Removing old user-writable install ($OldInstallDir)..." -ForegroundColor DarkGray
         Remove-Item $OldInstallDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if (-not (Ensure-Exe)) { return }
-
-    # Remove old task if it exists
-    if (Test-Task) {
-        Write-Host "Removing existing scheduled task..." -ForegroundColor Yellow
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    }
+    # -Force: always deploy the packaged exe, even when reinstalling over an existing one.
+    if (-not (Ensure-Exe -Force)) { return }
 
     Write-Host "Creating scheduled task '$TaskName'..." -ForegroundColor Cyan
 
