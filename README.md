@@ -71,7 +71,8 @@ lowered for a game, **grey** = paused. Right-click for status, pause/resume, log
 
 **Double-click the icon** (or *Open control panel…*) for the full **GUI window**: live
 device / format / state, running games, learned per-game profiles (clear one or reset
-all), a pause toggle, and an auto-start toggle.
+all), a pause toggle, and an auto-start toggle. **Right-click** a game or profile row to
+**Exclude** it (never manage) or **Lock it to a tier** — applied to the running game right away.
 
 ## How it works
 
@@ -89,6 +90,9 @@ all), a pause toggle, and an auto-start toggle.
    - **crash** — process exits non-zero within ~25 s (a clean exit is never a crash);
    - **glitch storm** — Warning+ events from `Microsoft-Windows-Audio`;
    - **silence** *(opt-in)* — audio session Active but the peak meter stays at zero.
+   If a game is silent *even at the lowest rate set before it opened audio* (a clean pre-set,
+   guaranteed by the freeze), the rate was never the cause — so it **stops dropping the format,
+   restores full quality, and suggests you `--exclude` it** rather than pinning it at the floor.
 4. **Probe** *(opt-in).* Occasionally retry a dropped game one tier higher to find its
    real ceiling and self-heal over-drops.
 5. **Restore.** When the last game exits, the idle/audiophile format is reapplied.

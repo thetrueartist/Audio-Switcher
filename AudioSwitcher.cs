@@ -1112,6 +1112,50 @@ namespace AudioSwitcher
         public static void SaveCrashLog(Dictionary<string, List<Dictionary<string, object>>> d) => Save(d, CrashLogFile);
         public static void SaveGlitchLog(Dictionary<string, List<Dictionary<string, object>>> d) => Save(d, GlitchLogFile);
 
+        // Shared by the CLI (--exclude) and the GUI right-click menu. Add/remove an exe from the
+        // never-manage denylist; excluding also forgets any learned profile. Returns true if changed.
+        public static bool SetExcluded(string exe, bool add)
+        {
+            if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exe += ".exe";
+            var cfg = LoadConfig();
+            bool has = cfg.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+            if (add && !has)
+            {
+                cfg.IgnoreProcesses.Add(exe);
+                cfg.GameProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+                Save(cfg, ConfigFile);
+                var ov = LoadOverrides();
+                if (ov.Remove(exe)) SaveOverrides(ov);
+                return true;
+            }
+            if (!add && has)
+            {
+                cfg.IgnoreProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+                Save(cfg, ConfigFile);
+                return true;
+            }
+            return false;
+        }
+
+        // Pin a game to a specific ladder tier as a locked manual override (also un-excludes it -
+        // you can't manage an excluded game). Used by the GUI "Lock to tier" menu.
+        public static void SetManualTier(string exe, int tier)
+        {
+            if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exe += ".exe";
+            var cfg = LoadConfig();
+            if (cfg.IgnoreProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase)) > 0)
+                Save(cfg, ConfigFile);
+            tier = Math.Clamp(tier, 0, cfg.ProfileTiers.Count - 1);
+            var t = cfg.ProfileTiers[tier];
+            var ov = LoadOverrides();
+            ov[exe] = new OverrideEntry
+            {
+                TierIdx = tier, Rate = t.Rate, Bits = t.Bits,
+                Locked = true, Reason = "manual (GUI)", Updated = DateTime.Now.ToString("o")
+            };
+            SaveOverrides(ov);
+        }
+
         private static Dictionary<string, T> LoadDict<T>(string path)
         {
             if (!File.Exists(path)) return new();
@@ -2233,6 +2277,30 @@ namespace AudioSwitcher
             catch { }
         }
 
+        // A manual edit (GUI right-click: Exclude / Lock to tier) changed a game's config. Apply it to
+        // any RUNNING instance now, not just next launch: if it's now excluded, release it (quality
+        // returns); otherwise re-resolve its tier from the new override and re-apply.
+        public void Reapply(string exe)
+        {
+            ReloadLists();
+            bool excluded = _config.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
+            lock (_lock)
+            {
+                foreach (var pid in _running.Where(kv => string.Equals(kv.Value.Exe, exe, StringComparison.OrdinalIgnoreCase))
+                                            .Select(kv => kv.Key).ToList())
+                {
+                    if (excluded) { _running.Remove(pid); _claimed.Remove(pid); }
+                    else
+                    {
+                        var prof = ResolveProfile(exe, _running[pid].Engine);
+                        _running[pid].TierIdx = prof.tier;
+                        _running[pid].Profile = new ProfileTier { Rate = prof.rate, Bits = prof.bits };
+                    }
+                }
+            }
+            ApplyEffective();
+        }
+
         // The daemon runs elevated (scheduled task, Highest), so a normal-privilege client
         // (.\AudioSwitcher.ps1 -Status, or re-opening the exe) can't open a default-ACL pipe ->
         // "Access denied". Grant only the CURRENT USER read/write - enough for the same-user client
@@ -2657,6 +2725,7 @@ namespace AudioSwitcher
             Controls.Add(new Label { Text = "Learned per-game profiles", AutoSize = true, Location = new Point(x, y),
                 ForeColor = Color.Gray }); y += 20;
             _overrides.SetBounds(x, y, w, 150); Controls.Add(_overrides); y += 158;
+            WireRowMenus();   // right-click a game/profile row -> Exclude / Lock to tier
 
             var btnClear = new Button { Text = "Clear selected", Location = new Point(x, y) };
             btnClear.Width = 130; btnClear.Height = 30;
@@ -2746,6 +2815,70 @@ namespace AudioSwitcher
             foreach (var f in new[] { StateStore.OverridesFile, StateStore.CrashLogFile, StateStore.GlitchLogFile })
                 try { if (File.Exists(f)) File.Delete(f); } catch { }
             Refresh2();
+        }
+
+        // Right-click a running-game or learned-profile row -> Exclude (stop managing) / Lock to tier.
+        // Reuses the same StateStore helpers the CLI uses, then applies the change to the live daemon
+        // so it takes effect immediately. Kept minimal: one shared menu, no extra windows.
+        private void WireRowMenus()
+        {
+            _games.MouseDown     += (_, e) => SelectUnderCursor(_games, e);
+            _overrides.MouseDown += (_, e) => SelectUnderCursor(_overrides, e);
+            _games.ContextMenuStrip     = BuildRowMenu(() => ExeFromLine(_games.SelectedItem as string, "  ("));
+            _overrides.ContextMenuStrip = BuildRowMenu(() => ExeFromLine(_overrides.SelectedItem as string, "  ->"));
+        }
+
+        private static void SelectUnderCursor(ListBox box, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Right) return;
+            int i = box.IndexFromPoint(e.Location);
+            if (i >= 0) box.SelectedIndex = i;   // so the menu acts on the row actually clicked
+        }
+
+        // Pull the exe from a list line ("exe  (rate/bits)" or "exe  ->  tier ..."). Placeholder
+        // rows like "(none)" return null so the menu no-ops.
+        private static string? ExeFromLine(string? line, string sep)
+        {
+            if (string.IsNullOrEmpty(line) || line.StartsWith("(")) return null;
+            int p = line.IndexOf(sep, StringComparison.Ordinal);
+            return p > 0 ? line.Substring(0, p) : null;
+        }
+
+        private ContextMenuStrip BuildRowMenu(Func<string?> getExe)
+        {
+            var menu = new ContextMenuStrip();
+
+            var exclude = new ToolStripMenuItem("Exclude (stop managing)");
+            exclude.Click += (_, __) =>
+            {
+                var exe = getExe();
+                if (exe == null) return;
+                StateStore.SetExcluded(exe, true);
+                _d.Reapply(exe);
+                Refresh2();
+            };
+            menu.Items.Add(exclude);
+
+            var setTier = new ToolStripMenuItem("Lock to tier");
+            var cfg = StateStore.LoadConfig();
+            for (int i = 0; i < cfg.ProfileTiers.Count; i++)
+            {
+                int tier = i;
+                var t = cfg.ProfileTiers[i];
+                var item = new ToolStripMenuItem($"{i}  -  {t.Rate}/{t.Bits}");
+                item.Click += (_, __) =>
+                {
+                    var exe = getExe();
+                    if (exe == null) return;
+                    StateStore.SetManualTier(exe, tier);
+                    _d.Reapply(exe);
+                    Refresh2();
+                };
+                setTier.DropDownItems.Add(item);
+            }
+            menu.Items.Add(setTier);
+
+            return menu;
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -3071,22 +3204,10 @@ namespace AudioSwitcher
         private static int SetExcluded(string exe, bool add)
         {
             if (!exe.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exe += ".exe";
-            var cfg = StateStore.LoadConfig();
-            bool has = cfg.IgnoreProcesses.Any(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
-            if (add)
-            {
-                if (!has) cfg.IgnoreProcesses.Add(exe);
-                cfg.GameProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase));
-                StateStore.Save(cfg, StateStore.ConfigFile);
-                var ov = StateStore.LoadOverrides();
-                if (ov.Remove(exe)) StateStore.SaveOverrides(ov);
-                Console.WriteLine(has ? $"{exe} is already excluded." : $"Excluded {exe} - AudioSwitcher will never manage it.");
-            }
-            else
-            {
-                if (has) { cfg.IgnoreProcesses.RemoveAll(n => string.Equals(n, exe, StringComparison.OrdinalIgnoreCase)); StateStore.Save(cfg, StateStore.ConfigFile); }
-                Console.WriteLine(has ? $"Un-excluded {exe}." : $"{exe} was not excluded.");
-            }
+            bool changed = StateStore.SetExcluded(exe, add);
+            Console.WriteLine(add
+                ? (changed ? $"Excluded {exe} - AudioSwitcher will never manage it." : $"{exe} is already excluded.")
+                : (changed ? $"Un-excluded {exe}." : $"{exe} was not excluded."));
             SendPipe("reload");   // apply to the running daemon immediately (no restart needed)
             return 0;
         }
