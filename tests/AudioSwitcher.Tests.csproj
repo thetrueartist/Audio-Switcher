@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net8.0 (NOT -windows): the pure logic under test is cross-platform, so the suite builds
+         and runs anywhere, including CI and the Linux dev box. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>AudioSwitcher.Tests</AssemblyName>
+    <RootNamespace>AudioSwitcher.Tests</RootNamespace>
+  </PropertyGroup>
+  <!-- Share the production source under test directly - no separate library, no third-party test
+       framework (keeps the project's zero-deps rule). The runner is a plain console app. -->
+  <ItemGroup>
+    <Compile Include="../Signing.cs" />
+  </ItemGroup>
+</Project>

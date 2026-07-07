@@ -1181,52 +1181,8 @@ namespace AudioSwitcher
         }
     }
 
-    // ====================================================================
-    // RELEASE SIGNING - ECDSA P-256, pure BCL. Protects auto-update against a
-    // compromised repo: only releases signed with the author's OFFLINE private key are
-    // trusted. Keep the private key off CI/GitHub - anything a compromised repo can reach.
-    // ====================================================================
-    public static class Signing
-    {
-        // Empty until the author embeds their public key (base64 SubjectPublicKeyInfo).
-        // Generate with --gen-signing-key. When empty, signature checks are skipped (the
-        // update check falls back to the plain release tag).
-        public const string PublicKeyB64 = "";
-
-        public static bool Enabled => PublicKeyB64.Length > 0;
-
-        public static (string priv, string pub) GenerateKeyPair()
-        {
-            using var ec = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-            return (Convert.ToBase64String(ec.ExportPkcs8PrivateKey()),
-                    Convert.ToBase64String(ec.ExportSubjectPublicKeyInfo()));
-        }
-
-        public static string Sign(byte[] data, string privB64)
-        {
-            using var ec = ECDsa.Create();
-            ec.ImportPkcs8PrivateKey(Convert.FromBase64String(privB64), out _);
-            return Convert.ToBase64String(ec.SignData(data, HashAlgorithmName.SHA256));
-        }
-
-        public static bool Verify(byte[] data, string sigB64)
-        {
-            try
-            {
-                if (!Enabled) return false;
-                using var ec = ECDsa.Create();
-                ec.ImportSubjectPublicKeyInfo(Convert.FromBase64String(PublicKeyB64), out _);
-                return ec.VerifyData(data, Convert.FromBase64String(sigB64), HashAlgorithmName.SHA256);
-            }
-            catch { return false; }
-        }
-
-        public static string Sha256Hex(byte[] data)
-        {
-            using var sha = SHA256.Create();
-            return Convert.ToHexString(sha.ComputeHash(data)).ToLowerInvariant();
-        }
-    }
+    // RELEASE SIGNING (class Signing) lives in Signing.cs so its crypto can be unit-tested
+    // without the Windows-only code here. It's still in the AudioSwitcher namespace.
 
     // ====================================================================
     // UPDATE CHECK - queries the public GitHub Releases API (no auth), notify-only

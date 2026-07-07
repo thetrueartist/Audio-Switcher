@@ -17,3 +17,7 @@ jobs:
           dotnet-version: '8.0.x'
       - name: Build
         run: dotnet build AudioSwitcher.csproj -c Release
+      - name: Test
+        # Dependency-free console suite (pure-logic: signing, config, profile resolution).
+        # Non-zero exit fails the build on a regression.
+        run: dotnet run --project tests/AudioSwitcher.Tests.csproj -c Release

@@ -18,4 +18,9 @@
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
+  <!-- The test project (tests/) has its own csproj and shares Signing.cs by reference; keep its
+       sources out of the app build (default globbing would otherwise pull them in). -->
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
+  </ItemGroup>
 </Project>
