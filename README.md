@@ -89,7 +89,8 @@ all), a pause toggle, and an auto-start toggle. **Right-click** a game or profil
 3. **Learn.** A game's tier is bumped down and remembered on any of:
    - **crash** — process exits non-zero within ~25 s (a clean exit is never a crash);
    - **glitch storm** — Warning+ events from `Microsoft-Windows-Audio`;
-   - **silence** *(opt-in)* — audio session Active but the peak meter stays at zero.
+   - **silence** *(opt-in)* — the **focused** game's audio session stays at zero (a backgrounded
+     game going quiet is ignored — many mute on focus loss, so judging it would misfire).
    If a game is silent *even at the lowest rate set before it opened audio* (a clean pre-set,
    guaranteed by the freeze), the rate was never the cause — so it **stops dropping the format,
    restores full quality, and suggests you `--exclude` it** rather than pinning it at the floor.

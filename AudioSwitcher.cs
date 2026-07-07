@@ -1421,6 +1421,21 @@ namespace AudioSwitcher
             }
             catch { return ""; }
         }
+
+        // PID that owns the current foreground window (0 if none / unknown). Used to only judge a
+        // game's silence while it's actually focused - a backgrounded/minimized game going quiet
+        // (many mute on focus loss) is normal, and flagging it would be a false positive.
+        public static uint ForegroundPid()
+        {
+            try
+            {
+                IntPtr hwnd = GetForegroundWindow();
+                if (hwnd == IntPtr.Zero) return 0;
+                GetWindowThreadProcessId(hwnd, out uint pid);
+                return pid;
+            }
+            catch { return 0; }
+        }
     }
 
     // ====================================================================
@@ -1988,11 +2003,17 @@ namespace AudioSwitcher
                         _meterEverPositive = true;
                         if (_verbose) Log("Silence detection: peak meter verified working");
                     }
+                    uint fgPid = Foreground.ForegroundPid();
                     if (sessions != null)
                         foreach (var g in games)
                         {
                             if (g.SawAudio || g.GaveUp) continue;
                             if ((now - g.StartedAt).TotalSeconds < _config.SilenceGraceSeconds) continue;
+                            // Only judge the game that owns the FOREGROUND window. A backgrounded or
+                            // minimized game going quiet is expected (many mute on focus loss), so
+                            // flagging it would be a false positive. Reset its timer so silence only
+                            // counts while it's focused - it starts fresh when you switch back to it.
+                            if ((uint)g.Pid != fgPid) { g.SilentSince = null; continue; }
                             var matches = sessions.Where(x => x.Pid == (uint)g.Pid).ToList();
                             if (matches.Count == 0) { g.SilentSince = null; continue; }   // no audio session -> can't judge
                             var s = matches[0];
