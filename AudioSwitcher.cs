@@ -926,15 +926,21 @@ namespace AudioSwitcher
         {
             string deviceId = "{0.0.0.00000000}." + endpoint.Guid;
             var pc = (IPolicyConfig)new CPolicyConfigClient();
+            IntPtr pd = IntPtr.Zero, pm = IntPtr.Zero;
             try
             {
-                string dev = pc.GetDeviceFormat(deviceId, 1, out IntPtr pd) == 0 && pd != IntPtr.Zero
+                string dev = pc.GetDeviceFormat(deviceId, 1, out pd) == 0 && pd != IntPtr.Zero
                     ? DescribeWaveFormat(pd) : "GetDeviceFormat failed";
-                string mix = pc.GetMixFormat(deviceId, out IntPtr pm) == 0 && pm != IntPtr.Zero
+                string mix = pc.GetMixFormat(deviceId, out pm) == 0 && pm != IntPtr.Zero
                     ? DescribeWaveFormat(pm) : "GetMixFormat failed";
                 return $"  deviceId  = {deviceId}\n  DeviceFmt = {dev}\n  MixFmt    = {mix}";
             }
-            finally { Marshal.ReleaseComObject(pc); }
+            finally
+            {
+                if (pd != IntPtr.Zero) Marshal.FreeCoTaskMem(pd);   // service-allocated WAVEFORMATEX blobs
+                if (pm != IntPtr.Zero) Marshal.FreeCoTaskMem(pm);
+                Marshal.ReleaseComObject(pc);
+            }
         }
 
         private static string DescribeWaveFormat(IntPtr p)
@@ -1341,9 +1347,11 @@ namespace AudioSwitcher
         // Once installed under Program Files, this folder inherits its admin-only-write ACL.
         private static string StagingDir()
         {
+            // If the exe dir can't be resolved, return "" so the caller ABORTS - never fall back to
+            // world-writable %TEMP% (that would reintroduce the read-then-execute TOCTOU / EoP).
             string exe = Process.GetCurrentProcess().MainModule?.FileName ?? "";
-            string baseDir = exe.Length > 0 ? (Path.GetDirectoryName(exe) ?? Path.GetTempPath()) : Path.GetTempPath();
-            return Path.Combine(baseDir, "update");
+            string? baseDir = exe.Length > 0 ? Path.GetDirectoryName(exe) : null;
+            return string.IsNullOrEmpty(baseDir) ? "" : Path.Combine(baseDir, "update");
         }
 
         // Downloads the zip, verifies its hash, and applies it. Returns "" on success (caller must
@@ -1354,6 +1362,7 @@ namespace AudioSwitcher
             {
                 if (string.IsNullOrEmpty(zipUrl)) return "no download URL";
                 string tmp = StagingDir();
+                if (tmp.Length == 0) return "cannot resolve a safe (admin-only) staging directory - update aborted";
                 Directory.CreateDirectory(tmp);
                 string zipPath = Path.Combine(tmp, "update.zip");
                 log?.Invoke("Downloading update...");
@@ -1408,12 +1417,15 @@ namespace AudioSwitcher
 
                 // Helper: wait for THIS process to exit, then start the new exe and remove .old.
                 int pid = Process.GetCurrentProcess().Id;
-                string helper = Path.Combine(StagingDir(), "restart.cmd");
+                // restart.cmd sits in the same admin-only staging dir as the zip; call System32 tools by
+                // FULL path so a planted tasklist/find/ping/schtasks on the user PATH can't be run instead.
+                string sys = Environment.SystemDirectory;
+                string helper = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(zipPath))!, "restart.cmd");
                 File.WriteAllText(helper,
                     "@echo off\r\n" +
                     ":wait\r\n" +
-                    $"tasklist /fi \"PID eq {pid}\" | find \"{pid}\" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)\r\n" +
-                    $"schtasks /run /tn AudioSwitcherDaemon >nul 2>nul || start \"\" \"{curExe}\"\r\n" +
+                    $"\"{sys}\\tasklist.exe\" /fi \"PID eq {pid}\" | \"{sys}\\find.exe\" \"{pid}\" >nul && (\"{sys}\\ping.exe\" -n 2 127.0.0.1 >nul & goto wait)\r\n" +
+                    $"\"{sys}\\schtasks.exe\" /run /tn AudioSwitcherDaemon >nul 2>nul || start \"\" \"{curExe}\"\r\n" +
                     $"del \"{oldExe}\" >nul 2>nul\r\n");
                 Process.Start(new ProcessStartInfo { FileName = helper, UseShellExecute = true,
                     CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden });
@@ -1886,12 +1898,16 @@ namespace AudioSwitcher
                                               : $"  freeze failed for {exe} (applying anyway)");
                 }
             }
-            // A "clean pre-set" = we froze the game at kernel-speed (ETW) detection, so the new format
-            // was live BEFORE it opened audio. Only then does lasting silence prove the rate isn't the
-            // cause (see SilencePolicy). A late WMI-path freeze doesn't qualify.
-            if (earlyDetect && frozen != IntPtr.Zero)
-                lock (_lock) { if (_running.TryGetValue(pid, out var rg)) rg.CleanPreset = true; }
-            try { ApplyEffective(); }
+            // Everything after Suspend runs inside the try so a throw can NEVER leave the game frozen -
+            // Resume must always run. A "clean pre-set" = we froze at kernel-speed (ETW) detection, so
+            // the new format was live BEFORE the game opened audio (only then does lasting silence prove
+            // the rate isn't the cause, per SilencePolicy; a late WMI-path freeze doesn't qualify).
+            try
+            {
+                if (earlyDetect && frozen != IntPtr.Zero)
+                    lock (_lock) { if (_running.TryGetValue(pid, out var rg)) rg.CleanPreset = true; }
+                ApplyEffective();
+            }
             finally { ProcessControl.Resume(frozen); }
         }
 
@@ -1966,11 +1982,42 @@ namespace AudioSwitcher
             }
         }
 
+        // Defense-in-depth vs COM hijacking (T1546.015). This elevated process activates system in-proc
+        // COM objects (CMMDeviceEnumerator, CPolicyConfigClient), and COM resolves HKCU\Software\Classes
+        // \CLSID BEFORE HKLM. A same-user medium-integrity process could register a malicious
+        // InprocServer32 there and get its DLL loaded into THIS high-integrity process. These system
+        // CLSIDs are never legitimately overridden per-user, so a per-user entry = a hijack: warn and
+        // remove it. Best-effort / racy (not a full fix - the proper one is architectural), but it kills
+        // the common persistent-hijack case. Called at startup and periodically.
+        private static readonly string[] _guardedClsids =
+            { "{BCDE0395-E52F-467C-8E3D-C4579291692E}", "{870af99c-171d-4f9e-af0d-e63df40c2bc9}" };
+        public static void RemoveComHijacks(Action<string>? warn = null)
+        {
+            foreach (var clsid in _guardedClsids)
+            {
+                try
+                {
+                    using (var key = Registry.CurrentUser.OpenSubKey($@"Software\Classes\CLSID\{clsid}\InprocServer32"))
+                    {
+                        if (key == null) continue;
+                        string dll = key.GetValue(null) as string ?? "(unknown)";
+                        warn?.Invoke($"[SECURITY] per-user COM override on system CLSID {clsid} -> '{dll}' (hijack); removing it");
+                    }
+                    Registry.CurrentUser.DeleteSubKeyTree($@"Software\Classes\CLSID\{clsid}", throwOnMissingSubKey: false);
+                }
+                catch { }
+            }
+        }
+
+        private DateTime _lastComCheck = DateTime.MinValue;
+
         private void GlitchPump()
         {
             while (!_shutdown.IsSet)
             {
                 if (_shutdown.Wait(500)) break;
+
+                if ((DateTime.Now - _lastComCheck).TotalSeconds >= 5) { _lastComCheck = DateTime.Now; RemoveComHijacks(Log); }
 
                 // Follow the Windows default output when it changes (from our dropdown OR from Windows),
                 // so we always manage what you're actually playing through. Only when not pinned.
@@ -2335,13 +2382,22 @@ namespace AudioSwitcher
                 try
                 {
                     using var server = CreatePipe();
+                    if (server == null) { if (!_shutdown.IsSet) Thread.Sleep(1000); continue; }
                     var connectTask = server.WaitForConnectionAsync();
                     while (!connectTask.IsCompleted && !_shutdown.IsSet) Thread.Sleep(100);
                     if (_shutdown.IsSet) return;
 
                     using var reader = new StreamReader(server, Encoding.UTF8, leaveOpen: true);
                     using var writer = new StreamWriter(server, Encoding.UTF8) { AutoFlush = true };
-                    string? cmd = reader.ReadLine();
+                    // Bounded + time-limited read: a same-user client can connect and then never send a
+                    // newline; a plain ReadLine would wedge this single-instance pipe forever (DoS).
+                    var buf = new char[256];   // commands are short words; cap the read
+                    var readTask = reader.ReadAsync(buf, 0, buf.Length);
+                    if (!readTask.Wait(3000)) continue;   // nothing in time -> drop the client, re-arm
+                    string cmd = new string(buf, 0, readTask.Result);
+                    int nl = cmd.IndexOfAny(new[] { '\r', '\n' });
+                    if (nl >= 0) cmd = cmd.Substring(0, nl);
+                    cmd = cmd.Trim();
                     if (cmd == "showgui")
                     {
                         ShowGuiRequested = true;   // the tray timer picks this up and opens the window
@@ -2474,7 +2530,7 @@ namespace AudioSwitcher
         // "Access denied". Grant only the CURRENT USER read/write - enough for the same-user client
         // at any integrity level, but not other users on a shared machine (tighter than Authenticated
         // Users, which the harmless showgui/status commands don't need exposed that widely).
-        private static NamedPipeServerStream CreatePipe()
+        private static NamedPipeServerStream? CreatePipe()
         {
             try
             {
@@ -2485,12 +2541,15 @@ namespace AudioSwitcher
                     me,
                     System.IO.Pipes.PipeAccessRights.ReadWrite,
                     System.Security.AccessControl.AccessControlType.Allow));
+                // FirstPipeInstance: refuse to attach to a pre-created (squatted) pipe of the same name.
                 return NamedPipeServerStreamAcl.Create("AudioSwitcherPipe", PipeDirection.InOut, 1,
-                    PipeTransmissionMode.Byte, PipeOptions.None, 0, 0, sec);
+                    PipeTransmissionMode.Byte, PipeOptions.FirstPipeInstance, 0, 0, sec);
             }
             catch
             {
-                return new NamedPipeServerStream("AudioSwitcherPipe", PipeDirection.InOut, 1);
+                // Fail CLOSED: never fall back to a default-ACL pipe (broader than current-user-only).
+                // Returning null just means IPC is unavailable this cycle - the core switching is fine.
+                return null;
             }
         }
 
@@ -2735,6 +2794,10 @@ namespace AudioSwitcher
                 }
             }
             catch { exe = cur; }
+            // Fail CLOSED: never register a Highest-privilege logon task at a non-admin-only path. If
+            // the exe isn't the Program Files copy (copy failed, or run un-installed), refuse - else a
+            // same-user process could overwrite that binary and run elevated at next logon (local EoP).
+            if (!string.Equals(exe, SecureExePath(), StringComparison.OrdinalIgnoreCase)) return;
             Run($"/create /tn \"{TaskName}\" /tr \"\\\"{exe}\\\"\" /sc onlogon /rl highest /f");
         }
 
@@ -2744,7 +2807,9 @@ namespace AudioSwitcher
         {
             try
             {
-                var psi = new ProcessStartInfo("schtasks.exe", args)
+                // Full System32 path so a planted schtasks.exe on the user PATH can't be run instead.
+                string schtasks = Path.Combine(Environment.SystemDirectory, "schtasks.exe");
+                var psi = new ProcessStartInfo(schtasks, args)
                 { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
                 using var p = Process.Start(psi);
                 if (p == null) return -1;
@@ -3203,6 +3268,8 @@ namespace AudioSwitcher
                 }
 
                 bool verbose = args.Contains("--verbose");
+                // Before the FIRST COM activation, strip any per-user hijack of the CLSIDs we activate.
+                Daemon.RemoveComHijacks(m => Console.Error.WriteLine(m));
                 var cfg = StateStore.LoadConfig();
                 var ep = EndpointManager.Resolve(cfg);
                 if (ep == null)
