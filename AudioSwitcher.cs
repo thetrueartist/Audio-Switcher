@@ -2359,22 +2359,26 @@ namespace AudioSwitcher
         public void SetDevice(string targetName)
         {
             targetName ??= "";
-            lock (_applyLock)
+            try   // never let a COM/enumeration hiccup escape to the UI thread and take down the tray
             {
-                var idle = _config.ProfileTiers[_config.IdleTier];
-                try { EndpointManager.SetFormat(_endpoint, idle.Rate, idle.Bits, _config.Channels, _verbose); }
-                catch (Exception ex) { if (_verbose) Log($"[warn] restoring old device failed: {ex.Message}"); }
+                lock (_applyLock)
+                {
+                    var idle = _config.ProfileTiers[_config.IdleTier];
+                    try { EndpointManager.SetFormat(_endpoint, idle.Rate, idle.Bits, _config.Channels, _verbose); }
+                    catch (Exception ex) { if (_verbose) Log($"[warn] restoring old device failed: {ex.Message}"); }
 
-                _config.TargetDeviceName = targetName;
-                try { var c = StateStore.LoadConfig(); c.TargetDeviceName = targetName; StateStore.Save(c, StateStore.ConfigFile); } catch { }
+                    _config.TargetDeviceName = targetName;
+                    try { var c = StateStore.LoadConfig(); c.TargetDeviceName = targetName; StateStore.Save(c, StateStore.ConfigFile); } catch { }
 
-                var ep = EndpointManager.Resolve(_config);
-                if (ep == null) { Log($"[warn] no playback device matches '{targetName}'; still managing {_endpoint.Name}"); return; }
-                _endpoint = ep;
-                _lastApplied = new ProfileTier { Rate = -1, Bits = -1 };   // unknown state on the new device -> force a fresh apply
-                Log($"Now managing device: {_endpoint.Name}{(targetName.Length == 0 ? " (system default)" : "")}");
+                    var ep = EndpointManager.Resolve(_config);
+                    if (ep == null) { Log($"[warn] no playback device matches '{targetName}'; still managing {_endpoint.Name}"); return; }
+                    _endpoint = ep;
+                    _lastApplied = new ProfileTier { Rate = -1, Bits = -1 };   // unknown state on the new device -> force a fresh apply
+                    Log($"Now managing device: {_endpoint.Name}{(targetName.Length == 0 ? " (system default)" : "")}");
+                }
+                ApplyEffective();
             }
-            ApplyEffective();
+            catch (Exception ex) { Log($"[warn] device switch failed: {ex.Message}"); }
         }
 
         // A manual edit (GUI right-click: Exclude / Lock to tier) changed a game's config. Apply it to
@@ -2807,10 +2811,14 @@ namespace AudioSwitcher
             _cboDevice.SelectedIndexChanged += (_, __) =>
             {
                 if (_syncingDevice) return;
-                // Index 0 = "(System default)" -> empty target; otherwise the picked device name.
-                string sel = _cboDevice.SelectedIndex <= 0 ? "" : (_cboDevice.SelectedItem as string ?? "");
-                _d.SetDevice(sel);
-                Refresh2();
+                try
+                {
+                    // Index 0 = "(System default)" -> empty target; otherwise the picked device name.
+                    string sel = _cboDevice.SelectedIndex <= 0 ? "" : (_cboDevice.SelectedItem as string ?? "");
+                    _d.SetDevice(sel);
+                    Refresh2();
+                }
+                catch { }
             };
             Controls.Add(_cboDevice); y += 32;
             _lblFormat.Location = new Point(x, y); _lblFormat.Font = new Font(Font, FontStyle.Bold);
