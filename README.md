@@ -173,17 +173,17 @@ ECDSA P-256 key; the app has the matching public key embedded and rejects any re
 whose manifest isn't validly signed (an attacker without the private key can't forge one).
 Pure .NET crypto, no third-party libs.
 
-Maintainer flow (the signing key never touches CI/GitHub):
+Signing is **active** (a public key is embedded), so the updater **fails closed**: a release
+without a valid signed manifest is never offered or applied.
+
+Maintainer flow (the signing key never touches CI/GitHub) — sign each release you want
+delivered via auto-update; mark anything you don't want to sign as a GitHub **pre-release**
+(the updater ignores pre-releases):
 
 ```powershell
-AudioSwitcher.exe --gen-signing-key         # once: writes AudioSwitcher-signing.key (keep OFFLINE), prints the public key to embed
-# per release, after the CI build:
-AudioSwitcher.exe --sign-release AudioSwitcher-win-x64.zip AudioSwitcher-signing.key 1.2.3
-# then attach manifest.json + manifest.sig to the GitHub release
+AudioSwitcher.exe --gen-signing-key    # once: writes the key to Documents (keep OFFLINE), prints the public key
+.\Sign-Release.ps1 v1.7.2              # per release: downloads the CI zip, signs locally, attaches manifest.json + manifest.sig
 ```
-
-Until a public key is embedded, the update check falls back to notify-only on the plain
-release tag.
 
 ## Anti-cheat
 

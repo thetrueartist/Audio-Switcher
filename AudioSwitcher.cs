@@ -1388,7 +1388,11 @@ namespace AudioSwitcher
                     !sha.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
                     return $"SHA-256 mismatch - update REJECTED (expected {expectedSha256}, got {sha})";
                 if (string.IsNullOrEmpty(expectedSha256))
+                {
+                    if (Signing.Enabled)   // fail CLOSED: signing is on, so an unsigned/unhashed zip is never applied
+                        return "no signed hash for this release - update REJECTED (signing is required)";
                     log?.Invoke("[warn] no signed hash to verify against (signing not enabled) - trusting TLS only");
+                }
 
                 string extract = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(zipPath))!, "extracted");
                 if (Directory.Exists(extract)) Directory.Delete(extract, true);

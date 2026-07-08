@@ -63,10 +63,10 @@ namespace AudioSwitcher.Tests
 
             Check("a garbage signature is rejected without throwing", !Signing.Verify(data, "not-base64!!", pub));
 
-            // Production path: with no key embedded, Verify(data,sig) must be disabled (returns false),
-            // so an unsigned/unknown build can never be trusted just because signing is "off".
-            Check("verify is disabled when no public key is embedded",
-                  Signing.Enabled == false && !Signing.Verify(data, sig));
+            // Production path: a public key is embedded, so signing is ENABLED and the updater fails
+            // closed. The 2-arg Verify (embedded key) must reject a signature made with any other key.
+            Check("signing is enabled (public key embedded)", Signing.Enabled);
+            Check("production verify rejects a signature not from the embedded key", !Signing.Verify(data, sig));
 
             // SHA-256 known-answer vector: sha256("") = e3b0c442...b855
             Check("sha256 matches the empty-string known vector",

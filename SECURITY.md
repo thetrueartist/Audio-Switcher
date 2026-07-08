@@ -40,7 +40,7 @@ name or clamped format values.
   is architectural (don't run the monitor elevated), which isn't possible here because
   the monitoring itself requires elevation. If you don't trust code already running as
   your user, that code has many paths to escalate — this is one of them.
-- **Auto-update authenticity** relies on a signed release manifest. Until the
-  maintainer's public key is embedded, the in-app update trusts TLS + GitHub only; it is
-  notify-then-click (never silent). Do not enable auto-update expectations beyond that
-  until signing is active.
+- **Auto-update authenticity** is enforced by a signed release manifest (ECDSA P-256,
+  maintainer key offline). The updater **fails closed** — a release without a valid signed
+  manifest is never offered or applied — so a repo/account/CI compromise can't push a
+  trojaned update without the offline private key. Updates are notify-then-click, never silent.

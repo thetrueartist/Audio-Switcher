@@ -13,10 +13,10 @@ namespace AudioSwitcher
     // ====================================================================
     public static class Signing
     {
-        // Empty until the author embeds their public key (base64 SubjectPublicKeyInfo).
-        // Generate with --gen-signing-key. When empty, signature checks are skipped (the
-        // update check falls back to the plain release tag).
-        public const string PublicKeyB64 = "";
+        // Maintainer's release-signing public key (base64 SubjectPublicKeyInfo, ECDSA P-256). The
+        // matching PRIVATE key is offline-only (never in the repo/CI). With this set, Enabled == true,
+        // so the update check REQUIRES a validly-signed manifest and fails closed on anything else.
+        public const string PublicKeyB64 = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAErlaokjzboEMXXqJOCT6qM1Vsgj353bvg9V19KWvr7Zv1t+gK9ESAavecocbDnZXs8TA0g1VFKMtgcd8jDWDDAg==";
 
         public static bool Enabled => PublicKeyB64.Length > 0;
 
