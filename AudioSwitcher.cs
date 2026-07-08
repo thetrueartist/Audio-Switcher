@@ -2762,6 +2762,7 @@ namespace AudioSwitcher
 
         private readonly Daemon _d;
         private readonly Label _lblDevice = Lbl(), _lblFormat = Lbl(), _lblState = Lbl();
+        private readonly Label _lblManaging = Lbl();   // confirms the actually-resolved managed device
         private readonly ListBox _games = new() { IntegralHeight = false };
         private readonly ListBox _overrides = new() { IntegralHeight = false };
         private readonly Button _btnPause = new();
@@ -2779,7 +2780,7 @@ namespace AudioSwitcher
         {
             _d = d;
             Text = "AudioSwitcher v" + Program.AppVersion();
-            ClientSize = new Size(460, 580);
+            ClientSize = new Size(460, 604);
             MinimumSize = new Size(420, 500);
             StartPosition = FormStartPosition.CenterScreen;
             Font = SystemFonts.MessageBoxFont ?? SystemFonts.DefaultFont;
@@ -2820,7 +2821,9 @@ namespace AudioSwitcher
                 }
                 catch { }
             };
-            Controls.Add(_cboDevice); y += 32;
+            Controls.Add(_cboDevice); y += 30;
+            _lblManaging.ForeColor = Color.Gray; _lblManaging.Location = new Point(x, y);
+            Controls.Add(_lblManaging); y += 24;
             _lblFormat.Location = new Point(x, y); _lblFormat.Font = new Font(Font, FontStyle.Bold);
             Controls.Add(_lblFormat); y += 24;
             _lblState.Location = new Point(x, y); Controls.Add(_lblState); y += 32;
@@ -2867,6 +2870,7 @@ namespace AudioSwitcher
         private void Refresh2()
         {
             PopulateDeviceCombo();
+            _lblManaging.Text = "managing:  " + _d.DeviceName;
             _lblFormat.Text = "Now:  " + _d.CurrentFormat;
             string state;
             Color stateColor = Color.Black;
