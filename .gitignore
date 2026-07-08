@@ -19,3 +19,10 @@ desktop.ini
 
 # Runtime state lives in %LOCALAPPDATA%\AudioSwitcher\, never in the repo:
 #   config.json, overrides.json, crash-log.json, glitch-log.json
+
+# NEVER commit a private signing key (public key lives in Signing.cs; private stays offline).
+*.key
+*-signing.key
+AudioSwitcher-signing.*
+manifest.json
+manifest.sig
