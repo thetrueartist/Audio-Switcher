@@ -3588,12 +3588,23 @@ namespace AudioSwitcher
         private static int GenSigningKey()
         {
             var (priv, pub) = Signing.GenerateKeyPair();
-            string keyPath = Path.Combine(Directory.GetCurrentDirectory(), "AudioSwitcher-signing.key");
-            File.WriteAllText(keyPath, priv);
-            Console.WriteLine($"Private key written to: {keyPath}");
+            // Default to Documents - the CWD is often an un-writable dir (e.g. system32).
+            string dir = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            if (string.IsNullOrEmpty(dir)) dir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string keyPath = Path.Combine(dir, "AudioSwitcher-signing.key");
+            string pubPath = Path.Combine(dir, "AudioSwitcher-signing.pub");
+            try { File.WriteAllText(keyPath, priv); File.WriteAllText(pubPath, pub); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Could not write to {dir}: {ex.Message}");
+                Console.Error.WriteLine("Run from a folder you can write to.");
+                return 1;
+            }
+            Console.WriteLine($"Private key: {keyPath}");
             Console.WriteLine("KEEP THIS FILE OFFLINE AND SECRET - never commit it or put it in CI/GitHub.");
+            Console.WriteLine($"Public key:  {pubPath}");
             Console.WriteLine();
-            Console.WriteLine("Embed this public key in Signing.PublicKeyB64:");
+            Console.WriteLine("Public key (embed in Signing.PublicKeyB64 / send to the maintainer):");
             Console.WriteLine(pub);
             return 0;
         }
