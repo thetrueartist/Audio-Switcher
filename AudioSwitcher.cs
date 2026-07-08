@@ -1542,7 +1542,7 @@ namespace AudioSwitcher
     public class Daemon
     {
         private readonly Config _config;
-        private readonly AudioEndpoint _endpoint;
+        private AudioEndpoint _endpoint;   // swappable: the user can change the managed device live (SetDevice)
         private readonly bool _verbose;
         private readonly Dictionary<int, RunningGame> _running = new();
         private readonly HashSet<int> _claimed = new();   // pids already taken (ETW-fast vs WMI dedup)
@@ -2312,6 +2312,10 @@ namespace AudioSwitcher
                         ReloadLists();   // pick up --exclude / --unexclude edits without a restart
                         Log("Reloaded exclusion / game lists from config.");
                     }
+                    else if (cmd == "setdevice")
+                    {
+                        SetDevice(StateStore.LoadConfig().TargetDeviceName);   // --set-device wrote the choice; switch live
+                    }
                     writer.WriteLine("END");
                 }
                 catch { if (!_shutdown.IsSet) Thread.Sleep(1000); }
@@ -2330,6 +2334,47 @@ namespace AudioSwitcher
                 _config.GameProcesses.Clear();   _config.GameProcesses.AddRange(fresh.GameProcesses);
             }
             catch { }
+        }
+
+        // Active playback devices the user can pick from, by name (deduped, sorted). The GUI offers
+        // "(System default)" - represented as an empty TargetDeviceName - as the first choice.
+        public List<string> DeviceChoices()
+        {
+            try
+            {
+                return EndpointManager.Enumerate().Where(EndpointManager.IsActive)
+                    .Select(e => e.Name).Where(n => !string.IsNullOrWhiteSpace(n))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(n => n).ToList();
+            }
+            catch { return new List<string>(); }
+        }
+
+        public string CurrentTargetName => _config.TargetDeviceName;
+
+        // Change which playback device the daemon manages, live. targetName "" = follow the system
+        // default; otherwise a name substring (matched by EndpointManager.Resolve). Restores the OLD
+        // device to its idle/audiophile format first (so we never abandon it lowered), re-resolves,
+        // swaps the endpoint, persists the choice, then applies the current effective format to the
+        // new device. Serialized under _applyLock so no format write races the swap.
+        public void SetDevice(string targetName)
+        {
+            targetName ??= "";
+            lock (_applyLock)
+            {
+                var idle = _config.ProfileTiers[_config.IdleTier];
+                try { EndpointManager.SetFormat(_endpoint, idle.Rate, idle.Bits, _config.Channels, _verbose); }
+                catch (Exception ex) { if (_verbose) Log($"[warn] restoring old device failed: {ex.Message}"); }
+
+                _config.TargetDeviceName = targetName;
+                try { var c = StateStore.LoadConfig(); c.TargetDeviceName = targetName; StateStore.Save(c, StateStore.ConfigFile); } catch { }
+
+                var ep = EndpointManager.Resolve(_config);
+                if (ep == null) { Log($"[warn] no playback device matches '{targetName}'; still managing {_endpoint.Name}"); return; }
+                _endpoint = ep;
+                _lastApplied = new ProfileTier { Rate = -1, Bits = -1 };   // unknown state on the new device -> force a fresh apply
+                Log($"Now managing device: {_endpoint.Name}{(targetName.Length == 0 ? " (system default)" : "")}");
+            }
+            ApplyEffective();
         }
 
         // A manual edit (GUI right-click: Exclude / Lock to tier) changed a game's config. Apply it to
@@ -2720,7 +2765,9 @@ namespace AudioSwitcher
         private bool _checking;
         private readonly CheckBox _chkAuto = new() { Text = "Start automatically at logon", AutoSize = true };
         private readonly System.Windows.Forms.Timer _timer = new() { Interval = 1000 };
+        private readonly ComboBox _cboDevice = new() { DropDownStyle = ComboBoxStyle.DropDownList };
         private bool _syncingAuto;
+        private bool _syncingDevice;
 
         private static Label Lbl() => new() { AutoSize = true };
 
@@ -2754,7 +2801,18 @@ namespace AudioSwitcher
             Controls.Add(_lblUpdate);
             y += 80;
 
-            _lblDevice.Location = new Point(x, y); Controls.Add(_lblDevice); y += 24;
+            _lblDevice.Text = "Device"; _lblDevice.AutoSize = true; _lblDevice.ForeColor = Color.Gray;
+            _lblDevice.Location = new Point(x, y + 5); Controls.Add(_lblDevice);
+            _cboDevice.SetBounds(x + 58, y, w - 58, 24);
+            _cboDevice.SelectedIndexChanged += (_, __) =>
+            {
+                if (_syncingDevice) return;
+                // Index 0 = "(System default)" -> empty target; otherwise the picked device name.
+                string sel = _cboDevice.SelectedIndex <= 0 ? "" : (_cboDevice.SelectedItem as string ?? "");
+                _d.SetDevice(sel);
+                Refresh2();
+            };
+            Controls.Add(_cboDevice); y += 32;
             _lblFormat.Location = new Point(x, y); _lblFormat.Font = new Font(Font, FontStyle.Bold);
             Controls.Add(_lblFormat); y += 24;
             _lblState.Location = new Point(x, y); Controls.Add(_lblState); y += 32;
@@ -2800,7 +2858,7 @@ namespace AudioSwitcher
 
         private void Refresh2()
         {
-            _lblDevice.Text = "Device:  " + _d.DeviceName;
+            PopulateDeviceCombo();
             _lblFormat.Text = "Now:  " + _d.CurrentFormat;
             string state;
             Color stateColor = Color.Black;
@@ -2833,6 +2891,37 @@ namespace AudioSwitcher
             _syncingAuto = true;
             try { _chkAuto.Checked = AutoStart.IsEnabled(); } catch { }
             _syncingAuto = false;
+        }
+
+        // Fill the device dropdown with "(System default)" + the active playback devices, and reflect
+        // the current choice. Guarded so the periodic refresh doesn't fire the change handler, and
+        // skipped while the list is open so it can't yank the selection out from under the user.
+        private void PopulateDeviceCombo()
+        {
+            if (_cboDevice.DroppedDown) return;
+            _syncingDevice = true;
+            try
+            {
+                var items = new List<string> { "(System default)" };
+                items.AddRange(_d.DeviceChoices());
+
+                bool same = _cboDevice.Items.Count == items.Count;
+                if (same)
+                    for (int i = 0; i < items.Count; i++)
+                        if (!Equals(_cboDevice.Items[i], items[i])) { same = false; break; }
+                if (!same) { _cboDevice.Items.Clear(); foreach (var it in items) _cboDevice.Items.Add(it); }
+
+                string cur = _d.CurrentTargetName;
+                int sel = 0;   // 0 = system default
+                if (!string.IsNullOrEmpty(cur))
+                {
+                    int m = items.FindIndex(it => it.IndexOf(cur, StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (m > 0) sel = m;
+                }
+                if (_cboDevice.SelectedIndex != sel && sel < _cboDevice.Items.Count) _cboDevice.SelectedIndex = sel;
+            }
+            catch { }
+            finally { _syncingDevice = false; }
         }
 
         private static void SyncList(ListBox box, List<string> items)
@@ -3031,6 +3120,18 @@ namespace AudioSwitcher
                 int unexIdx = Array.IndexOf(args, "--unexclude");
                 if (unexIdx >= 0 && unexIdx + 1 < args.Length) return SetExcluded(args[unexIdx + 1], false);
                 if (args.Contains("--list-excluded")) return ListExcluded();
+
+                int sdIdx = Array.IndexOf(args, "--set-device");
+                if (sdIdx >= 0)
+                {
+                    string name = (sdIdx + 1 < args.Length && !args[sdIdx + 1].StartsWith("--")) ? args[sdIdx + 1] : "";
+                    if (name.Equals("default", StringComparison.OrdinalIgnoreCase)) name = "";
+                    var c = StateStore.LoadConfig(); c.TargetDeviceName = name; StateStore.Save(c, StateStore.ConfigFile);
+                    Console.WriteLine(name.Length == 0 ? "Managing the system default playback device."
+                                                      : $"Managing the playback device matching '{name}'.");
+                    SendPipe("setdevice");   // switch the running daemon live
+                    return 0;
+                }
 
                 bool verbose = args.Contains("--verbose");
                 var cfg = StateStore.LoadConfig();

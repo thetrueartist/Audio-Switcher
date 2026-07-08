@@ -34,7 +34,8 @@ game, exactly when a game needs it — automatically.
 
 - **Automatic.** Detects games at launch (Steam/Epic/EA/Ubisoft/GOG/Battle.net/Xbox…),
   lowers the rate, restores your audiophile format when they exit.
-- **Manages the current default playback device** out of the box — not tied to one DAC.
+- **Manages the current default playback device** out of the box — not tied to one DAC. Or pick a
+  specific device from a dropdown in the GUI (or `--set-device`); it switches live.
 - **Learns each game's limit** from real signals: a crash (non-zero exit), an ETW audio
   glitch storm, or "running but silent" — and remembers it. An optional upward probe
   re-tests whether a game can go higher, to find the true ceiling.
@@ -69,10 +70,11 @@ After install it runs at every logon and lives in your **system tray**.
 The tray speaker icon shows state at a glance: **green** = full quality, **amber** =
 lowered for a game, **grey** = paused. Right-click for status, pause/resume, logs, quit.
 
-**Double-click the icon** (or *Open control panel…*) for the full **GUI window**: live
-device / format / state, running games, learned per-game profiles (clear one or reset
-all), a pause toggle, and an auto-start toggle. **Right-click** a game or profile row to
-**Exclude** it (never manage) or **Lock it to a tier** — applied to the running game right away.
+**Double-click the icon** (or *Open control panel…*) for the full **GUI window**: a **device
+dropdown** (switch which endpoint it manages, live), format / state, running games, learned
+per-game profiles (clear one or reset all), a pause toggle, and an auto-start toggle.
+**Right-click** a game or profile row to **Exclude** it (never manage) or **Lock it to a tier** —
+applied to the running game right away.
 
 ## How it works
 
