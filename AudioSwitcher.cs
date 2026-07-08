@@ -1797,6 +1797,12 @@ namespace AudioSwitcher
                                       OverrideEntry? ovEntry, Dictionary<string, OverrideEntry> overrides,
                                       string reason, bool allowSuspend, bool earlyDetect = false)
         {
+            // The slow path sleeps ~1s before we get here, so a short-lived stub may already be gone -
+            // and its stop event would have fired and missed it. Don't register a dead process (the
+            // GlitchPump reaper is the backstop if it dies right after this check).
+            try { using var chk = Process.GetProcessById(pid); if (chk.HasExited) return; }
+            catch { return; }
+
             var profile = ResolveProfile(exe, engine);
             int tier = profile.tier, rate = profile.rate, bits = profile.bits;
             string source = profile.source;
@@ -1939,6 +1945,33 @@ namespace AudioSwitcher
                 lock (_lock) { anyRunning = _running.Count > 0; }
                 if (!anyRunning) continue;
 
+                // Reap dead entries. A short-lived process (e.g. a launcher stub that exits in ~1s) can
+                // die DURING our detection delay, so its stop event fires before we add it and it lingers
+                // forever - and if it had a low tier it would hold the device lowered. Belt to the
+                // aliveness check in RegisterAndApply: prune any running game whose process is gone, then
+                // re-apply in case that changed the effective (lowest) tier or freed the device to idle.
+                if ((DateTime.Now - _lastReap).TotalSeconds >= 3)
+                {
+                    _lastReap = DateTime.Now;
+                    var dead = new List<int>();
+                    lock (_lock)
+                    {
+                        foreach (var kv in _running)
+                        {
+                            bool alive;
+                            try { using var p = Process.GetProcessById(kv.Key); alive = !p.HasExited; }
+                            catch { alive = false; }
+                            if (!alive) dead.Add(kv.Key);
+                        }
+                        foreach (var pid in dead) { _running.Remove(pid); _claimed.Remove(pid); }
+                    }
+                    if (dead.Count > 0)
+                    {
+                        if (_verbose) Log($"Reaped {dead.Count} exited game(s) from the running list");
+                        ApplyEffective();
+                    }
+                }
+
                 int processed = 0;
                 while (EtwMonitor.Events.TryDequeue(out var ev) && processed++ < 200)
                 {
@@ -2064,6 +2097,7 @@ namespace AudioSwitcher
         }
 
         private DateTime _lastSilenceCheck = DateTime.MinValue;
+        private DateTime _lastReap = DateTime.MinValue;   // throttles the dead-game reaper in GlitchPump
         private bool _meterEverPositive;   // set once we've seen the peak meter read >0 (proves it works)
 
         // Auto-learn: watch for an exclusive-fullscreen D3D app that isn't already known, and after
