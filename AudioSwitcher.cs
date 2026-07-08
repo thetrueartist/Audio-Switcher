@@ -857,11 +857,21 @@ namespace AudioSwitcher
          InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
         private interface IPolicyConfig
         {
-            // Declared in vtable order; only SetDeviceFormat is called.
+            // Declared in vtable ORDER - each entry must occupy one slot even if unused, so the
+            // methods we DO call (SetDeviceFormat @6, SetDefaultEndpoint @13) land on the right slot.
+            // The placeholders are never invoked, so their signatures don't matter.
             [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string id, out IntPtr fmt);
             [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id, int bDefault, out IntPtr fmt);
             [PreserveSig] int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id);
             [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string id, IntPtr endpointFmt, IntPtr mixFmt);
+            [PreserveSig] int GetProcessingPeriod();   // 7  (placeholder)
+            [PreserveSig] int SetProcessingPeriod();   // 8  (placeholder)
+            [PreserveSig] int GetShareMode();          // 9  (placeholder)
+            [PreserveSig] int SetShareMode();          // 10 (placeholder)
+            [PreserveSig] int GetPropertyValue();      // 11 (placeholder)
+            [PreserveSig] int SetPropertyValue();      // 12 (placeholder)
+            // 13: HRESULT SetDefaultEndpoint(LPCWSTR wszDeviceId, ERole eRole) - route audio to a device.
+            [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string id, int role);
         }
 
         public static void SetFormat(AudioEndpoint endpoint, int sampleRate, int bitDepth, int channels, bool verbose)
@@ -889,6 +899,27 @@ namespace AudioSwitcher
                 Marshal.FreeHGlobal(pEp);
                 Marshal.FreeHGlobal(pMix);
             }
+        }
+
+        // Make this endpoint the Windows default output (routes audio to it), for all three roles so
+        // both media and comms follow. This is the "change output device" action. Returns success.
+        public static bool SetDefaultAudioDevice(AudioEndpoint endpoint, bool verbose)
+        {
+            string deviceId = "{0.0.0.00000000}." + endpoint.Guid;
+            IPolicyConfig? pc = null;
+            try
+            {
+                pc = (IPolicyConfig)new CPolicyConfigClient();
+                foreach (int role in new[] { 0, 1, 2 })   // eConsole, eMultimedia, eCommunications
+                {
+                    int hr = pc.SetDefaultEndpoint(deviceId, role);
+                    if (hr != 0) { if (verbose) Console.WriteLine($"    SetDefaultEndpoint role {role} failed 0x{hr:X8}"); return false; }
+                }
+                if (verbose) Console.WriteLine($"    default output -> {endpoint.Name}");
+                return true;
+            }
+            catch (Exception ex) { if (verbose) Console.WriteLine($"    SetDefaultEndpoint threw: {ex.Message}"); return false; }
+            finally { if (pc != null) Marshal.ReleaseComObject(pc); }
         }
 
         public static string ProbeFormats(AudioEndpoint endpoint)
@@ -1941,6 +1972,24 @@ namespace AudioSwitcher
             {
                 if (_shutdown.Wait(500)) break;
 
+                // Follow the Windows default output when it changes (from our dropdown OR from Windows),
+                // so we always manage what you're actually playing through. Only when not pinned.
+                if ((DateTime.Now - _lastDefaultCheck).TotalSeconds >= 3 && string.IsNullOrWhiteSpace(_config.TargetDeviceName))
+                {
+                    _lastDefaultCheck = DateTime.Now;
+                    try
+                    {
+                        var def = EndpointManager.GetDefaultRender();
+                        if (def != null && !string.Equals(def.Guid, _endpoint.Guid, StringComparison.OrdinalIgnoreCase))
+                        {
+                            lock (_applyLock) { _endpoint = def; _lastApplied = new ProfileTier { Rate = -1, Bits = -1 }; }
+                            Log($"Default output changed -> now managing {def.Name}");
+                            ApplyEffective();
+                        }
+                    }
+                    catch { }
+                }
+
                 bool anyRunning;
                 lock (_lock) { anyRunning = _running.Count > 0; }
                 if (!anyRunning) continue;
@@ -2098,6 +2147,7 @@ namespace AudioSwitcher
 
         private DateTime _lastSilenceCheck = DateTime.MinValue;
         private DateTime _lastReap = DateTime.MinValue;   // throttles the dead-game reaper in GlitchPump
+        private DateTime _lastDefaultCheck = DateTime.MinValue;   // throttles the default-output follow
         private bool _meterEverPositive;   // set once we've seen the peak meter read >0 (proves it works)
 
         // Auto-learn: watch for an exclusive-fullscreen D3D app that isn't already known, and after
@@ -2356,29 +2406,43 @@ namespace AudioSwitcher
         // device to its idle/audiophile format first (so we never abandon it lowered), re-resolves,
         // swaps the endpoint, persists the choice, then applies the current effective format to the
         // new device. Serialized under _applyLock so no format write races the swap.
-        public void SetDevice(string targetName)
+        // Switch the Windows DEFAULT OUTPUT to this device (routes your audio there, like a device
+        // switcher) and manage it going forward. Restores the device we're leaving to its idle format
+        // so it's not left lowered. Serialized under _applyLock; wrapped so a COM hiccup can't escape
+        // to the tray UI thread.
+        public void SetDevice(string deviceName)
         {
-            targetName ??= "";
-            try   // never let a COM/enumeration hiccup escape to the UI thread and take down the tray
+            if (string.IsNullOrWhiteSpace(deviceName)) return;
+            try
             {
                 lock (_applyLock)
                 {
+                    var target = EndpointManager.FindByName(deviceName);
+                    if (target == null) { Log($"[warn] no output device named '{deviceName}'"); return; }
+
                     var idle = _config.ProfileTiers[_config.IdleTier];
-                    try { EndpointManager.SetFormat(_endpoint, idle.Rate, idle.Bits, _config.Channels, _verbose); }
-                    catch (Exception ex) { if (_verbose) Log($"[warn] restoring old device failed: {ex.Message}"); }
+                    try { EndpointManager.SetFormat(_endpoint, idle.Rate, idle.Bits, _config.Channels, _verbose); } catch { }
 
-                    _config.TargetDeviceName = targetName;
-                    try { var c = StateStore.LoadConfig(); c.TargetDeviceName = targetName; StateStore.Save(c, StateStore.ConfigFile); } catch { }
+                    if (!EndpointManager.SetDefaultAudioDevice(target, _verbose))
+                        Log($"[warn] couldn't set '{target.Name}' as the default output");
 
-                    var ep = EndpointManager.Resolve(_config);
-                    if (ep == null) { Log($"[warn] no playback device matches '{targetName}'; still managing {_endpoint.Name}"); return; }
-                    _endpoint = ep;
-                    _lastApplied = new ProfileTier { Rate = -1, Bits = -1 };   // unknown state on the new device -> force a fresh apply
-                    Log($"Now managing device: {_endpoint.Name}{(targetName.Length == 0 ? " (system default)" : "")}");
+                    // We now follow the default (which we just set), so don't pin TargetDeviceName.
+                    _config.TargetDeviceName = "";
+                    try { var c = StateStore.LoadConfig(); c.TargetDeviceName = ""; StateStore.Save(c, StateStore.ConfigFile); } catch { }
+                    _endpoint = target;
+                    _lastApplied = new ProfileTier { Rate = -1, Bits = -1 };   // force a fresh apply on the new device
+                    Log($"Switched output to: {_endpoint.Name}");
                 }
                 ApplyEffective();
             }
-            catch (Exception ex) { Log($"[warn] device switch failed: {ex.Message}"); }
+            catch (Exception ex) { Log($"[warn] output switch failed: {ex.Message}"); }
+        }
+
+        // The current Windows default output device's name (for the GUI to select in the dropdown).
+        public string CurrentDefaultName()
+        {
+            try { return EndpointManager.GetDefaultRender()?.Name ?? _endpoint.Name; }
+            catch { return _endpoint.Name; }
         }
 
         // A manual edit (GUI right-click: Exclude / Lock to tier) changed a game's config. Apply it to
@@ -2814,9 +2878,8 @@ namespace AudioSwitcher
                 if (_syncingDevice) return;
                 try
                 {
-                    // Index 0 = "(System default)" -> empty target; otherwise the picked device name.
-                    string sel = _cboDevice.SelectedIndex <= 0 ? "" : (_cboDevice.SelectedItem as string ?? "");
-                    _d.SetDevice(sel);
+                    string sel = _cboDevice.SelectedItem as string ?? "";
+                    if (sel.Length > 0) _d.SetDevice(sel);   // route audio to the picked device + manage it
                     Refresh2();
                 }
                 catch { }
@@ -2914,8 +2977,7 @@ namespace AudioSwitcher
             _syncingDevice = true;
             try
             {
-                var items = new List<string> { "(System default)" };
-                items.AddRange(_d.DeviceChoices());
+                var items = _d.DeviceChoices();   // active output devices; the selected one is the current default
 
                 bool same = _cboDevice.Items.Count == items.Count;
                 if (same)
@@ -2923,14 +2985,10 @@ namespace AudioSwitcher
                         if (!Equals(_cboDevice.Items[i], items[i])) { same = false; break; }
                 if (!same) { _cboDevice.Items.Clear(); foreach (var it in items) _cboDevice.Items.Add(it); }
 
-                string cur = _d.CurrentTargetName;
-                int sel = 0;   // 0 = system default
-                if (!string.IsNullOrEmpty(cur))
-                {
-                    int m = items.FindIndex(it => it.IndexOf(cur, StringComparison.OrdinalIgnoreCase) >= 0);
-                    if (m > 0) sel = m;
-                }
-                if (_cboDevice.SelectedIndex != sel && sel < _cboDevice.Items.Count) _cboDevice.SelectedIndex = sel;
+                string cur = _d.CurrentDefaultName();
+                int sel = items.FindIndex(it => string.Equals(it, cur, StringComparison.OrdinalIgnoreCase));
+                if (sel < 0) sel = items.FindIndex(it => it.IndexOf(cur, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (sel >= 0 && _cboDevice.SelectedIndex != sel && sel < _cboDevice.Items.Count) _cboDevice.SelectedIndex = sel;
             }
             catch { }
             finally { _syncingDevice = false; }
@@ -3137,10 +3195,9 @@ namespace AudioSwitcher
                 if (sdIdx >= 0)
                 {
                     string name = (sdIdx + 1 < args.Length && !args[sdIdx + 1].StartsWith("--")) ? args[sdIdx + 1] : "";
-                    if (name.Equals("default", StringComparison.OrdinalIgnoreCase)) name = "";
+                    if (name.Length == 0) { Console.Error.WriteLine("Usage: --set-device \"<device name>\""); return 1; }
                     var c = StateStore.LoadConfig(); c.TargetDeviceName = name; StateStore.Save(c, StateStore.ConfigFile);
-                    Console.WriteLine(name.Length == 0 ? "Managing the system default playback device."
-                                                      : $"Managing the playback device matching '{name}'.");
+                    Console.WriteLine($"Switching output to the device matching '{name}'.");
                     SendPipe("setdevice");   // switch the running daemon live
                     return 0;
                 }
