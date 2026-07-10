@@ -95,9 +95,13 @@ applied to the running game right away.
    - **glitch storm** — Warning+ events from `Microsoft-Windows-Audio`;
    - **silence** *(opt-in)* — the **focused** game's audio session stays at zero (a backgrounded
      game going quiet is ignored — many mute on focus loss, so judging it would misfire).
-   If a game is silent *even at the lowest rate set before it opened audio* (a clean pre-set,
-   guaranteed by the freeze), the rate was never the cause — so it **stops dropping the format,
-   restores full quality, and suggests you `--exclude` it** rather than pinning it at the floor.
+   When a **running** game fails (glitch/silence), the rate is lowered **once** and learned — then
+   AudioSwitcher **tells you to restart the game**, because most games read the audio format *only at
+   launch*, so the new rate can't take effect until they relaunch (and walking it down further mid-run
+   would just over-drop it to the floor for nothing). On the restart it's set *before* the game opens
+   audio. `AutoRelaunchGame` (off by default) will restart it for you. And if it's silent even at the
+   lowest rate set before launch, the rate was never the cause — it stops dropping the format, restores
+   full quality, and suggests you `--exclude` it.
 4. **Probe** *(opt-in).* Occasionally retry a dropped game one tier higher to find its
    real ceiling and self-heal over-drops.
 5. **Restore.** When the last game exits, the idle/audiophile format is reapplied.
@@ -144,6 +148,10 @@ First run creates `%LOCALAPPDATA%\AudioSwitcher\config.json`. Notable fields:
   for this long gets bumped down. Safe on-by-default because the daemon self-verifies the
   peak meter reads sound before ever acting (a broken meter can't misfire). 0 = off.
   `SilenceGraceSeconds` ignores the first N seconds (loading).
+- `AutoRelaunchGame` — **off by default.** When a running game is silenced/glitching and a lower rate
+  is learned, most games only pick up a new rate on relaunch. Off = a tray notification asks you to
+  restart it. On = AudioSwitcher restarts it for you (kill + start the exe) — best-effort; store/DRM
+  games may need a manual restart and you'd lose the current session.
 - `ProbeEveryLaunches` — **0 = off**; set e.g. `5` to enable the upward probe.
 - `SuspendDuringSwitch` — **on by default.** For a *known* game (already learned or known-quirky),
   freeze it the instant it launches, change the format, then resume — so it can't open its audio

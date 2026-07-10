@@ -13,7 +13,7 @@
     <UseWindowsForms>true</UseWindowsForms>
     <NoWarn>CA1416</NoWarn>
     <!-- Local/source builds show this; the release workflow overrides it with -p:Version=<tag>. -->
-    <Version>1.7.2</Version>
+    <Version>1.8.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="System.Management" Version="8.0.0" />

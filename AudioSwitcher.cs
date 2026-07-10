@@ -47,7 +47,7 @@ namespace AudioSwitcher
 
     public class Config
     {
-        public int ConfigVersion { get; set; } = 9;   // bump when built-in defaults change; triggers a regen
+        public int ConfigVersion { get; set; } = 10;   // bump when built-in defaults change; triggers a regen
         public string TargetDeviceName { get; set; } = "";   // empty = current default playback device
         public bool CheckForUpdates { get; set; } = true;    // check GitHub Releases at startup (notify only)
         public int Channels { get; set; } = 2;
@@ -87,6 +87,11 @@ namespace AudioSwitcher
         // the protected ones. Set false only if you know your game has no anti-cheat and want the
         // freeze unconditionally.
         public bool SuspendSkipIfAntiCheat { get; set; } = true;
+        // When a game comes up silent, the rate is lowered and LEARNED, but most games only read the
+        // audio format at launch - so the game must be relaunched to actually try the new rate. Default:
+        // notify you to restart it. If true, AudioSwitcher relaunches it for you (kill + start the exe;
+        // best-effort - store/DRM games may need a manual restart, and you'd lose the current session).
+        public bool AutoRelaunchGame { get; set; } = false;
 
         public List<ProfileTier> ProfileTiers { get; set; } = new()
         {
@@ -1503,6 +1508,7 @@ namespace AudioSwitcher
         public bool IsProbe;            // this launch is an upward probe (one tier above the learned override)
         public bool Failed;             // a crash/glitch/silence bump fired this session
         public bool CleanPreset;        // we set the format BEFORE this game opened audio (froze it at kernel-speed detect)
+        public bool AwaitingRestart;    // learned a lower tier mid-session; the game must RELAUNCH to test it - stop re-judging
         public bool GaveUp;             // concluded its silence isn't rate-related -> stop re-judging it this session
     }
 
@@ -2085,7 +2091,7 @@ namespace AudioSwitcher
                         else if (_running.Count == 1)
                             target = _running.Values.First();
                     }
-                    if (target == null) continue;
+                    if (target == null || target.AwaitingRestart) continue;
 
                     target.GlitchHistory.Add(ev.When);
                     var cutoff = DateTime.Now.AddSeconds(-_config.GlitchWindowSeconds);
@@ -2105,12 +2111,15 @@ namespace AudioSwitcher
                         StateStore.SaveGlitchLog(gl);
 
                         target.Failed = true;
+                        int gOldRate = target.Profile.Rate, gOldBits = target.Profile.Bits;
                         if (BumpProfileDown(target.Exe, target.Engine, "ETW glitch storm"))
                         {
                             var prof = ResolveProfile(target.Exe, target.Engine);
                             target.TierIdx = prof.tier;
                             target.Profile = new ProfileTier { Rate = prof.rate, Bits = prof.bits };
-                            ApplyEffective();
+                            ApplyEffective();   // helps games that react to a live change; others need the relaunch
+                            target.AwaitingRestart = true;
+                            OnRateLearned(target, gOldRate, gOldBits);
                         }
                         target.GlitchHistory.Clear();
                     }
@@ -2140,7 +2149,7 @@ namespace AudioSwitcher
                     if (sessions != null)
                         foreach (var g in games)
                         {
-                            if (g.SawAudio || g.GaveUp) continue;
+                            if (g.SawAudio || g.GaveUp || g.AwaitingRestart) continue;
                             if ((now - g.StartedAt).TotalSeconds < _config.SilenceGraceSeconds) continue;
                             // Only judge the game that owns the FOREGROUND window. A backgrounded or
                             // minimized game going quiet is expected (many mute on focus loss), so
@@ -2164,12 +2173,18 @@ namespace AudioSwitcher
                                     case SilenceAction.Bump:
                                         Log($"! {g.Exe}: {how} {_config.SilenceWindowSeconds}s -> format likely unusable");
                                         g.Failed = true;
+                                        int oldRate = g.Profile.Rate, oldBits = g.Profile.Bits;
                                         if (BumpProfileDown(g.Exe, g.Engine, "running but silent"))
                                         {
                                             var prof = ResolveProfile(g.Exe, g.Engine);
                                             g.TierIdx = prof.tier;
                                             g.Profile = new ProfileTier { Rate = prof.rate, Bits = prof.bits };
-                                            ApplyEffective();
+                                            ApplyEffective();   // gives games that DO react to a live format change a chance this session
+                                            // Most games read the rate only at launch, so lowering again mid-session can't help
+                                            // them. Stop walking down (which would over-drop to the floor) and get the game
+                                            // relaunched so the new rate is actually tested - set before it opens audio.
+                                            g.AwaitingRestart = true;
+                                            OnRateLearned(g, oldRate, oldBits);
                                         }
                                         break;
                                     case SilenceAction.GiveUpNotRateRelated:
@@ -2290,6 +2305,62 @@ namespace AudioSwitcher
             StateStore.SaveOverrides(overrides);
             Log($"  {exe}: sample rate isn't the cause - no longer dropping the format for it. Run  --exclude {exe}  to ignore it entirely.");
         }
+
+        // A running game failed at its current rate and we learned a lower one. Most games read the
+        // audio format only at launch, so the new rate can't apply until the game restarts. Notify the
+        // user to restart it - or, if AutoRelaunchGame is on, relaunch it for them (best-effort).
+        private void OnRateLearned(RunningGame g, int oldRate, int oldBits)
+        {
+            int nr = g.Profile.Rate;
+            if (_config.AutoRelaunchGame)
+            {
+                Log($"  {g.Exe}: learned {nr}Hz; auto-relaunching (games read the rate only at launch)");
+                Notify("AudioSwitcher", $"{g.Exe} had no sound - restarting it at {nr} Hz.");
+                RelaunchGame(g.Pid, g.Exe, g.ExePath);
+            }
+            else
+            {
+                Log($"  {g.Exe}: learned {nr}Hz - RESTART the game to apply (it reads the rate only at launch)");
+                Notify("AudioSwitcher - restart the game", $"{g.Exe} had no sound at {oldRate} Hz. Set {nr} Hz for it - restart the game to apply.");
+            }
+        }
+
+        // Best-effort relaunch: kill the game's process tree, then start its exe again so it comes back
+        // pre-set to the new rate. Store/DRM games may refuse to launch from the exe directly - then we
+        // fall back to asking the user to restart it. Off the pump thread.
+        private void RelaunchGame(int pid, string exe, string knownPath)
+        {
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                string path = knownPath;
+                if (string.IsNullOrEmpty(path))
+                    try { using var p = Process.GetProcessById(pid); path = p.MainModule?.FileName ?? ""; } catch { }
+                try { using var p = Process.GetProcessById(pid); p.Kill(entireProcessTree: true); p.WaitForExit(6000); } catch { }
+                if (string.IsNullOrEmpty(path))
+                {
+                    Log($"  couldn't resolve {exe}'s path to relaunch - please restart it manually");
+                    Notify("AudioSwitcher", $"Couldn't auto-restart {exe} - restart it manually to apply the new rate.");
+                    return;
+                }
+                Thread.Sleep(1500);   // let it die and the new rate settle before it opens audio again
+                try { Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); Log($"  relaunched {exe}"); }
+                catch (Exception ex)
+                {
+                    Log($"  couldn't relaunch {exe}: {ex.Message} - please restart it manually");
+                    Notify("AudioSwitcher", $"Couldn't auto-restart {exe} - restart it manually to apply the new rate.");
+                }
+            });
+        }
+
+        // Small queue of tray notifications; the tray timer drains it and shows balloons.
+        private readonly System.Collections.Concurrent.ConcurrentQueue<(string title, string text)> _notifications = new();
+        private void Notify(string title, string text)
+        {
+            while (_notifications.Count > 5) _notifications.TryDequeue(out _);
+            _notifications.Enqueue((title, text));
+        }
+        public (string title, string text)? DequeueNotification()
+            => _notifications.TryDequeue(out var n) ? n : null;
 
         private bool BumpProfileDown(string exe, string engine, string reason)
         {
@@ -2705,6 +2776,11 @@ namespace AudioSwitcher
             {
                 // Someone re-opened the exe (or clicked the Start Menu shortcut) -> show the window.
                 if (daemon.ShowGuiRequested) { daemon.ShowGuiRequested = false; OpenWindow(); }
+
+                // Drain any pending notifications (e.g. "restart the game to apply the new rate").
+                var note = daemon.DequeueNotification();
+                if (note.HasValue)
+                    try { tray.BalloonTipTitle = note.Value.title; tray.BalloonTipText = note.Value.text; tray.ShowBalloonTip(8000); } catch { }
 
                 // Green = at full/idle quality (even if a game is running), amber = actually lowered, grey = paused.
                 Color c = daemon.Paused ? Grey : (daemon.CurrentIsIdleFormat ? Green : Amber);
